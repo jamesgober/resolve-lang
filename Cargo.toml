@@ -1,0 +1,78 @@
+# =============================================================================
+#  R E P S   ·   resolve-lang
+# =============================================================================
+[package]
+name    = "resolve-lang"
+version = "0.1.0"
+
+# Minimum Supported Rust Version (MSRV)
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
+readme = "README.md"
+
+# Description
+description = "Name resolution over HIR: scopes, namespaces, imports, and a persistent definition and reference index."
+
+# Keywords (5 max)
+keywords = ["resolution", "scope", "compiler", "language", "lexersketch"]
+
+# Categories
+categories = ["compilers", "development-tools", "no-std"]
+
+# Links
+homepage      = "https://github.com/jamesgober/resolve-lang"
+repository    = "https://github.com/jamesgober/resolve-lang"
+documentation = "https://docs.rs/resolve-lang"
+
+# Authors
+authors = ["James Gober <me@jamesgober.com>"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "resolve_lang"
+path = "src/lib.rs"
+
+
+# FEATURE FLAGS
+# #################################
+[features]
+default = ["std"]
+std = []
+
+
+# DEPENDENCIES
+# #################################
+[dependencies]
+# First-party -lang dependencies are wired at v0.2.0, when first used.
+
+
+# DEV DEPENDENCIES
+# #################################
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest  = "1"
+
+
+# BENCHMARKS
+# #################################
+[[bench]]
+name    = "bench"
+harness = false
+
+
+# RELEASE PROFILE
+# #################################
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
