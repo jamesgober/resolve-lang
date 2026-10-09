@@ -16,7 +16,7 @@ use crate::{
     imports::resolve_imports,
     index::{Index, RawRef, Target, UnitInput},
     members::{Members, finish_deferred},
-    model::{Model, ScopeKind, Unit, ix},
+    model::{Fold, Model, ScopeKind, Unit, ix},
     pass::{Pass, UnitOut, entry_gate},
     policy::{Namespace, Policy},
     suggest::Suggester,
@@ -727,6 +727,7 @@ impl Program<'_> {
         }
         let mut m = Model {
             policy: self.policy,
+            fold: Fold::build(&self.policy, names),
             env: self.env,
             units: Vec::with_capacity(self.units.len()),
             unit_ix,
@@ -746,13 +747,14 @@ impl Program<'_> {
                 import: ix(m.imports.len()),
                 sum: ix(m.sums.len()),
             };
-            let c = collect(&hir, &m.policy, bases);
+            let c = collect(&hir, &m.policy, &m.fold, bases);
             m.scopes.extend(c.scopes);
             m.bindings.extend(c.bindings);
             m.imports.extend(c.imports);
             m.sums.extend(c.sums);
             if let Some(name) = name {
-                m.roots.push((name, ix(u)));
+                let key = m.fold.key_ns(&m.policy, Namespace::Module, name);
+                m.roots.push((key, ix(u)));
             }
             m.units.push(Unit {
                 id: hir.unit(),
@@ -799,7 +801,7 @@ impl Program<'_> {
             }
         }
         // Phase 4: members, mixins, deferred paths.
-        let mut members = Members::build(&mut m, &outs, self.budget.member_steps());
+        let mut members = Members::build(&mut m, &outs, self.budget.member_steps())?;
         finish_deferred(&m, &mut members, &mut outs)?;
         // Apply plans to the HIR.
         for (unit, out) in m.units.iter_mut().zip(outs.iter_mut()) {
@@ -913,7 +915,7 @@ fn assemble(m: Model<'_>, outs: Vec<UnitOut>, members: &Members) -> Resolution {
             }
         })
         .collect();
-    let index = Index::build(&inputs);
+    let index = Index::build(&inputs, &m.fold);
     drop(inputs);
     // Class members per unit.
     let mut class_members: Vec<Vec<(ItemId, Vec<ClassMember>)>> =
@@ -934,7 +936,7 @@ fn assemble(m: Model<'_>, outs: Vec<UnitOut>, members: &Members) -> Resolution {
                     _ => None,
                 };
                 Some(ClassMember {
-                    name: mem.name,
+                    name: b.name,
                     namespace: Namespace::from_index(mem.ns as usize),
                     res: b.res,
                     vis: b.vis,

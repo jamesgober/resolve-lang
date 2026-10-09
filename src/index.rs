@@ -444,6 +444,9 @@ pub struct Index {
     /// External definitions by target, sorted.
     externals: Vec<(Target, u32)>,
     units: Vec<UnitIx>,
+    /// By reference: whether it spells its definition's name (up to the
+    /// case folding of the policy), so a rename edits it.
+    same_name: Vec<bool>,
 }
 
 /// Maps an origin to a source location, through expansions.
@@ -520,8 +523,9 @@ pub(crate) struct UnitInput<'a> {
 }
 
 impl Index {
-    /// Builds the index of a whole program.
-    pub(crate) fn build(units: &[UnitInput<'_>]) -> Self {
+    /// Builds the index of a whole program. `fold` decides which spellings
+    /// of a name are the same name (case-insensitive tables).
+    pub(crate) fn build(units: &[UnitInput<'_>], fold: &crate::model::Fold) -> Self {
         let mut me = Self::default();
         let mut maps: Vec<Mapper> = Vec::with_capacity(units.len());
         for u in units {
@@ -563,6 +567,11 @@ impl Index {
                 if let Some(v) = via {
                     by_via.push((v.0, ix(me.refs.len())));
                 }
+                let same = me.defs.get(def as usize).is_some_and(|d| {
+                    d.name == seg.name
+                        || (via.is_none() && fold.name(d.name) == fold.name(seg.name))
+                });
+                me.same_name.push(same);
                 let reference = Reference {
                     location: map.map(seg.origin),
                     def: DefRef(def),
@@ -1014,7 +1023,8 @@ impl Index {
     }
 
     /// Every edit renaming a definition implies: its own name and every
-    /// reference that spells the same name (references through an aliased
+    /// reference that spells the same name, up to the case folding of a
+    /// case-insensitive table (references through an aliased
     /// import spell the alias and are left alone). Renaming an aliased
     /// import edits the alias and the references that went through it.
     ///
@@ -1054,8 +1064,16 @@ impl Index {
                 }
             }
         } else {
-            for r in self.references(def) {
-                if r.name == d.name {
+            let ids = match (
+                self.by_def_off.get(def.index()),
+                self.by_def_off.get(def.index() + 1),
+            ) {
+                (Some(&lo), Some(&hi)) => self.by_def.get(lo as usize..hi as usize).unwrap_or(&[]),
+                _ => &[],
+            };
+            for &r in ids {
+                let same = self.same_name.get(r as usize).copied().unwrap_or(false);
+                if let Some(r) = self.refs.get(r as usize).filter(|_| same) {
                     add(r.location);
                 }
             }

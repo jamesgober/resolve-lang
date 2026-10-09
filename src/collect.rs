@@ -15,8 +15,8 @@ use hir_lang::{
 use crate::{
     diag::DiagKind,
     env::DefKind,
-    model::{Binding, Import, ImportState, NONE, Origin, Scope, ScopeKind, ix},
-    policy::{Hoist, ItemClass, Namespace, Policy},
+    model::{Binding, Fold, Import, ImportState, NONE, Origin, Scope, ScopeKind, ix},
+    policy::{Hoist, ItemClass, Namespace, Policy, TABLES},
 };
 
 /// What one unit contributes, with indexes already offset into the model's
@@ -67,6 +67,7 @@ enum Pending {
 struct Collector<'a> {
     hir: &'a Hir,
     policy: &'a Policy,
+    fold: &'a Fold,
     bases: Bases,
     out: Collected,
     /// Per open scope: its table (local index) or `NONE`.
@@ -78,12 +79,13 @@ struct Collector<'a> {
 }
 
 /// Collects one unit.
-pub(crate) fn collect(hir: &Hir, policy: &Policy, bases: Bases) -> Collected {
+pub(crate) fn collect(hir: &Hir, policy: &Policy, fold: &Fold, bases: Bases) -> Collected {
     let n_items = hir.count(IdKind::Item);
     let n_exprs = hir.count(IdKind::Expr);
     let mut c = Collector {
         hir,
         policy,
+        fold,
         bases,
         out: Collected {
             scopes: Vec::new(),
@@ -284,7 +286,7 @@ impl Collector<'_> {
                     self.hir.unit(),
                     hir_lang::Def::Item(i),
                 ));
-                let mut seen = [false; 5];
+                let mut seen = [false; TABLES];
                 for ns in occupies.iter() {
                     let t = self.policy.table_ix(ns);
                     let Some(slot) = seen.get_mut(t as usize) else {
@@ -297,6 +299,7 @@ impl Collector<'_> {
                     self.out.bindings.push(Binding {
                         ns: t,
                         name,
+                        key: self.fold.key(t, name),
                         res,
                         kind: def_kind,
                         vis: item.vis,
@@ -380,7 +383,7 @@ impl Collector<'_> {
             if let Some(scope) = self.out.scopes.get(s) {
                 order.extend_from_slice(&scope.defs);
             }
-            let key = |b: u32, bs: &[Binding]| bs.get((b - base) as usize).map(|b| (b.ns, b.name));
+            let key = |b: u32, bs: &[Binding]| bs.get((b - base) as usize).map(|b| (b.ns, b.key));
             // Stable: equal names keep declaration order.
             order.sort_by_key(|b| key(*b, &self.out.bindings));
             let mut i = 0;

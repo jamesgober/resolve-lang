@@ -11,13 +11,22 @@
 //!
 //! Paths that need class member tables (`self::x`, `parent::x`,
 //! `Class::member`) are planned partially here and finished after mixin
-//! expansion (see `members`).
+//! expansion (see `members`). So are unqualified names inside a class whose
+//! members are lexically visible (`ClassScope::Lexical`) and that inherits:
+//! an inherited member shadows a name of an enclosing scope, but inherited
+//! members are only known once every base is resolved. Such a path is
+//! resolved now as if nothing were inherited, the outcome is set aside, and
+//! the member phase either replaces it with the inherited member or commits
+//! it unchanged.
+//!
+//! Every table lookup goes through the table's key (`Fold::key`), so a
+//! case-insensitive table finds a name in any ASCII case.
 
 use alloc::{collections::BTreeMap, vec::Vec};
 
 use hir_lang::{
-    BinderId, BinderKind, Control, Event, Frame, Hir, IdKind, ItemId, ItemKind, Name, NodeRef, Ns,
-    Pat, PathId, PathRoot, Res, Span, Stmt,
+    BinderId, BinderKind, Control, Event, Expr, ExprId, Frame, Hir, IdKind, ItemId, ItemKind, Name,
+    NodeRef, Ns, Pat, PathId, PathRoot, Res, Span, Stmt,
 };
 use intern_lang::Lookup;
 
@@ -26,7 +35,7 @@ use crate::{
     env::DefKind,
     imports::Hit,
     model::{ANY_NS, EntryState, ImportState, Model, NONE, Origin, ScopeKind, Unit, ix},
-    policy::{ClassScope, Hoist, ItemClass, ModuleScope, Namespace, Shadowing},
+    policy::{ClassScope, Hoist, ItemClass, ModuleScope, Namespace, Shadowing, TABLES},
     suggest::{MAX_CANDIDATES, Suggester},
 };
 
@@ -59,6 +68,9 @@ pub(crate) enum DeferKind {
         seg: u32,
         container: Hit,
     },
+    /// An unqualified name an inherited member may shadow; the index of the
+    /// set-aside outcome in `UnitOut::fallbacks`.
+    Lexical(u32),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -68,6 +80,25 @@ pub(crate) struct Deferred {
     pub(crate) ctx: TypeCtx,
     /// The module scope the path is in (for module access checks).
     pub(crate) module: u32,
+    /// Whether the path is the callee of a call (functions before constants).
+    pub(crate) callee: bool,
+}
+
+/// The outcome of resolving a path as if nothing were inherited, set aside
+/// until the member phase knows whether an inherited member shadows it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Fallback {
+    /// The classes (member-table scopes) whose inherited members are
+    /// searched, innermost first.
+    pub(crate) classes: Vec<u32>,
+    /// The pattern, when the path is a bare identifier pattern's.
+    pub(crate) pat: Option<hir_lang::PatId>,
+    pub(crate) plan: Option<(Res, u32)>,
+    pub(crate) diagnosed: bool,
+    pub(crate) segs: Vec<SegRef>,
+    pub(crate) diags: Vec<Diagnostic>,
+    pub(crate) deferred: Vec<Deferred>,
+    pub(crate) ident_matches: Vec<hir_lang::PatId>,
 }
 
 /// What phase 3 produced for one unit.
@@ -81,6 +112,8 @@ pub(crate) struct UnitOut {
     pub(crate) diags: Vec<Diagnostic>,
     /// `Pat::Ident` patterns whose path named a constant (they match, not bind).
     pub(crate) ident_matches: Vec<hir_lang::PatId>,
+    /// Set-aside outcomes of `DeferKind::Lexical` paths.
+    pub(crate) fallbacks: Vec<Fallback>,
 }
 
 impl UnitOut {
@@ -176,6 +209,21 @@ enum Cand {
     Entry(u32, u32),
 }
 
+/// A class scope whose members are lexically visible, open on the walk.
+#[derive(Clone, Copy)]
+struct LexClass {
+    table: u32,
+    /// The walk depth of its table scope (its own members' depth).
+    depth: u32,
+    world: u32,
+    /// Whether it has bases or mixins (members not on the shadow stacks).
+    inherits: bool,
+    /// Whether the walk is past the class header (generics, bases,
+    /// interfaces) and into its fields and members. The header never sees
+    /// the class's inherited members: the bases are what it names.
+    in_body: bool,
+}
+
 /// What a path's context makes of it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ctx {
@@ -212,10 +260,18 @@ pub(crate) struct Pass<'p, 'e, L> {
     shadow_log: Vec<Name>,
     pending: Pending,
     hint: Option<NodeRef>,
+    /// By expression index: whether it is the callee of a call. Empty when
+    /// the policy keeps constants in the value table (no difference then).
+    callees: Vec<bool>,
+    lex_classes: Vec<LexClass>,
+    /// Fully folded names of every class member of the program (built only
+    /// under `ClassScope::Lexical`), sorted: a set-aside name that is one of
+    /// them is likely inherited, so its outcome skips did-you-mean.
+    member_names: Vec<Name>,
+    /// Suggestions are off while resolving such a name.
+    quiet: bool,
     pub(crate) out: UnitOut,
 }
-
-const TABLES: usize = 5;
 
 impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
     pub(crate) fn new(
@@ -229,6 +285,8 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
         let n_paths = hir.count(IdKind::Path);
         // Only names some path starts with can be looked up lexically: the
         // shadow stacks are keyed by those names alone.
+        // Under case folding a name is looked up by its key in each table,
+        // which is the name itself or its folded form; both are keys here.
         let mut keys: Vec<Name> = Vec::with_capacity(n_paths);
         for i in 0..n_paths {
             let Some(p) = PathId::from_index(i).and_then(|p| hir.get_path(p)) else {
@@ -236,11 +294,47 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
             };
             if let Some(seg) = hir.list(p.segments).first() {
                 keys.push(seg.name);
+                let folded = m.fold.name(seg.name);
+                if folded != seg.name {
+                    keys.push(folded);
+                }
             }
         }
         keys.sort();
         keys.dedup();
+        let split = m.policy.table_ix(Namespace::Const) != m.policy.table_ix(Namespace::Value);
+        let mut callees = Vec::new();
+        if split {
+            let n = hir.count(IdKind::Expr);
+            callees = alloc::vec![false; n];
+            for i in 0..n {
+                let Some(e) = ExprId::from_index(i) else {
+                    continue;
+                };
+                if let Some(Expr::Call { callee, .. }) = hir.get_expr(e) {
+                    if let Some(slot) = callees.get_mut(callee.index()) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
         let heads = alloc::vec![NONE; keys.len().saturating_mul(TABLES)];
+        let mut member_names: Vec<Name> = Vec::new();
+        if m.policy.class_scope() == ClassScope::Lexical {
+            for scope in &m.scopes {
+                if matches!(scope.kind, ScopeKind::Type(..)) {
+                    member_names.extend(
+                        scope
+                            .defs
+                            .iter()
+                            .filter_map(|b| m.bindings.get(*b as usize))
+                            .map(|b| m.fold.name(b.name)),
+                    );
+                }
+            }
+            member_names.sort();
+            member_names.dedup();
+        }
         Some(Self {
             m,
             names,
@@ -266,6 +360,10 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
             shadow_log: Vec::new(),
             pending: Pending::None,
             hint: None,
+            callees,
+            lex_classes: Vec::new(),
+            member_names,
+            quiet: false,
             out: UnitOut {
                 plan: alloc::vec![None; n_paths],
                 diagnosed: alloc::vec![false; n_paths],
@@ -273,6 +371,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
                 deferred: Vec::new(),
                 diags: Vec::new(),
                 ident_matches: Vec::new(),
+                fallbacks: Vec::new(),
             },
         })
     }
@@ -304,7 +403,15 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
                 match node {
                     NodeRef::Path(p) => self.path(p),
                     NodeRef::Item(i) => {
+                        // A mixin use names what the class inherits, like
+                        // its bases: it is header, not body.
+                        let mixin = matches!(self.hir.item(i).kind, ItemKind::MixinUse(_));
+                        self.enter_member(!mixin);
                         self.push_gated(i);
+                        self.hint = Some(node);
+                    }
+                    NodeRef::Field(_) => {
+                        self.enter_member(true);
                         self.hint = Some(node);
                     }
                     NodeRef::Expr(e) => {
@@ -328,6 +435,18 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
             Event::ScopeClose => self.scope_close(),
             Event::Bind(b) => self.bind(b),
             _ => self.pending = Pending::None,
+        }
+    }
+
+    /// A field or item is entered: if it is a direct member of the
+    /// innermost lexical class, the walk is in that class's body (`body`)
+    /// or in a part that names what it inherits (a mixin use).
+    fn enter_member(&mut self, body: bool) {
+        let here = self.tables.last().copied();
+        if let Some(c) = self.lex_classes.last_mut() {
+            if here == Some(c.table) {
+                c.in_body = body;
+            }
         }
     }
 
@@ -413,7 +532,22 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
             if entry_gate(self.m, entry.state).is_some() {
                 continue;
             }
-            self.push_entry(entry.ns, entry.name, ctx, Item::Table(table, ix(e)));
+            self.push_entry(*entry, ctx, Item::Table(table, ix(e)));
+        }
+        if let ScopeKind::Type(item, true) = scope.kind {
+            if self.m.policy.class_scope() == ClassScope::Lexical {
+                let has_bases = match &self.hir.item(item).kind {
+                    ItemKind::Class(c) => !c.bases.is_empty(),
+                    _ => false,
+                };
+                self.lex_classes.push(LexClass {
+                    table,
+                    depth: self.depth,
+                    world: self.world,
+                    inherits: has_bases || !scope.mixin_uses.is_empty(),
+                    in_body: false,
+                });
+            }
         }
     }
 
@@ -439,6 +573,9 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
         if let Some(t) = self.tables.pop() {
             if t != NONE {
                 let _ = self.open_tables.pop();
+                if self.lex_classes.last().is_some_and(|c| c.table == t) {
+                    let _ = self.lex_classes.pop();
+                }
             }
         }
         let Some(rec) = self.scopes.pop() else { return };
@@ -473,7 +610,8 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
         };
         if binder.kind == BinderKind::TypeParam {
             let t = self.m.policy.table_ix(Namespace::Type);
-            self.push_key(t, binder.name, NONE, Item::Binder(b));
+            let key = self.m.fold.key(t, binder.name);
+            self.push_key(t, key, NONE, Item::Binder(b));
         }
         let policy = self.m.policy.shadowing();
         if policy == Shadowing::Allow || !binder.kind.is_value() {
@@ -530,20 +668,23 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
             let Some(ctx) = self.table_ctx(scope) else {
                 continue;
             };
-            self.push_entry(e.ns, e.name, ctx, Item::Table(scope, entry));
+            self.push_entry(e, ctx, Item::Table(scope, entry));
         }
     }
 
-    fn push_entry(&mut self, ns: u8, name: Name, ctx: u32, item: Item) {
-        if ns == ANY_NS {
+    fn push_entry(&mut self, entry: crate::model::Entry, ctx: u32, item: Item) {
+        if entry.ns == ANY_NS {
             for t in 0..TABLES as u8 {
-                self.push_key(t, name, ctx, item);
+                let key = self.m.fold.key(t, entry.spelling);
+                self.push_key(t, key, ctx, item);
             }
         } else {
-            self.push_key(ns, name, ctx, item);
+            self.push_key(entry.ns, entry.name, ctx, item);
         }
     }
 
+    /// Pushes `item` on the shadow stack of `name` (already a key of table
+    /// `t`) in table `t`.
     fn push_key(&mut self, t: u8, name: Name, ctx: u32, item: Item) {
         let Ok(k) = self.keys.binary_search(&name) else {
             return;
@@ -574,7 +715,8 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
 
     /// The innermost visible entry for `name` in table `t`.
     fn top(&self, t: u8, name: Name) -> Option<StackEntry> {
-        let k = self.keys.binary_search(&name).ok()?;
+        let key = self.m.fold.key(t, name);
+        let k = self.keys.binary_search(&key).ok()?;
         let mut at = *self.heads.get(k * TABLES + t as usize)?;
         for _ in 0..3 {
             let e = *self.entries.get(at as usize)?;
@@ -677,11 +819,13 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
         }
         if path.root.is_type_root() {
             let ctx = self.type_ctx.last().copied().unwrap_or(TypeCtx::None);
+            let callee = self.is_callee(p);
             self.out.deferred.push(Deferred {
                 path: p,
                 kind: DeferKind::Root(path.root),
                 ctx,
                 module: self.module(),
+                callee,
             });
             return;
         }
@@ -721,31 +865,21 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
         }
     }
 
-    /// The table indexes a segment searches.
-    fn tables_for(&self, ns: Ns, prefix: bool) -> Vec<u8> {
-        let list: &[Namespace] = if prefix {
-            &[Namespace::Module, Namespace::Type]
-        } else {
-            match ns {
-                Ns::Value | Ns::Pattern => &[Namespace::Value],
-                Ns::Type => &[Namespace::Type],
-                Ns::Region => &[],
-                Ns::Import => &[
-                    Namespace::Value,
-                    Namespace::Type,
-                    Namespace::Module,
-                    Namespace::Macro,
-                ],
+    /// Whether path `p` is the callee of a call (only tracked when the
+    /// policy keeps constants apart from functions).
+    fn is_callee(&self, p: PathId) -> bool {
+        match self.hint {
+            Some(NodeRef::Expr(e)) => {
+                self.callees.get(e.index()).copied().unwrap_or(false)
+                    && matches!(self.hir.get_expr(e), Some(Expr::Path(q)) if *q == p)
             }
-        };
-        let mut out = Vec::with_capacity(list.len());
-        for ns in list {
-            let t = self.m.policy.table_ix(*ns);
-            if !out.contains(&t) {
-                out.push(t);
-            }
+            _ => false,
         }
-        out
+    }
+
+    /// The table indexes a segment searches.
+    fn tables_for(&self, ns: Ns, prefix: bool, callee: bool) -> Vec<u8> {
+        tables_for(&self.m.policy, ns, prefix, callee)
     }
 
     fn hit_of_binding(&self, b: u32) -> Option<Hit> {
@@ -758,8 +892,123 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
     }
 
     /// Resolves the first `count` segments of `p` (the rest, `rest`, are
-    /// left type-directed).
+    /// left type-directed). An unqualified name that an inherited member
+    /// may shadow is resolved and set aside for the member phase.
     fn resolve(&mut self, p: PathId, ctx: Ctx, count: usize, rest: usize) {
+        let path = *self.hir.path(p);
+        let shadowable = path.root == PathRoot::Relative
+            && path.qself.is_none()
+            && matches!(ctx, Ctx::Normal | Ctx::PatIdent(_))
+            && !self.lex_classes.is_empty();
+        if shadowable {
+            if let Some(first) = self.hir.list(path.segments).first().copied() {
+                let classes = self.inheriting_classes(p, first.name, count > 1 || rest > 0);
+                if !classes.is_empty() {
+                    self.set_aside(p, ctx, count, rest, classes);
+                    return;
+                }
+            }
+        }
+        self.resolve_now(p, ctx, count, rest);
+    }
+
+    /// The lexically visible classes, innermost first, whose inherited
+    /// members could shadow the best lexical candidate for `name`: those
+    /// that inherit and enclose that candidate's scope.
+    fn inheriting_classes(&self, p: PathId, name: Name, prefix: bool) -> Vec<u32> {
+        let ns = self.hir.path(p).ns;
+        let callee = self.is_callee(p);
+        let mut best: Option<u32> = None;
+        if ns != Ns::Import {
+            if let Some(b) = self.hir.lookup_local(p, name) {
+                let (depth, seq) = self
+                    .binder_info
+                    .get(b.index())
+                    .copied()
+                    .unwrap_or((0, NONE));
+                if seq != NONE {
+                    best = Some(depth);
+                }
+            }
+        }
+        for t in self.tables_for(ns, prefix, callee) {
+            if let Some(e) = self.top(t, name) {
+                best = Some(best.map_or(e.depth, |d| d.max(e.depth)));
+            }
+        }
+        let mut out = Vec::new();
+        for c in self.lex_classes.iter().rev() {
+            if c.world != self.world || best.is_some_and(|d| d >= c.depth) {
+                break;
+            }
+            if c.inherits && c.in_body {
+                out.push(c.table);
+            }
+        }
+        out
+    }
+
+    /// Resolves `p` as if nothing were inherited, then sets the outcome
+    /// aside (restoring `out`) behind a `DeferKind::Lexical` deferral.
+    fn set_aside(&mut self, p: PathId, ctx: Ctx, count: usize, rest: usize, classes: Vec<u32>) {
+        let i = p.index();
+        let plan0 = self.out.plan.get(i).copied().flatten();
+        let diagnosed0 = self.out.diagnosed.get(i).copied().unwrap_or(false);
+        let (segs0, diags0, deferred0, idents0) = (
+            self.out.segs.len(),
+            self.out.diags.len(),
+            self.out.deferred.len(),
+            self.out.ident_matches.len(),
+        );
+        // A name some class defines is most likely an inherited member, and
+        // then this outcome is discarded: do not pay for a suggestion that
+        // will not be shown. A genuine typo is rarely a member name anywhere,
+        // so it keeps its suggestion.
+        let first = self
+            .hir
+            .list(self.hir.path(p).segments)
+            .first()
+            .map(|s| s.name);
+        self.quiet = first.is_some_and(|n| {
+            self.member_names
+                .binary_search(&self.m.fold.name(n))
+                .is_ok()
+        });
+        self.resolve_now(p, ctx, count, rest);
+        self.quiet = false;
+        let fallback = Fallback {
+            classes,
+            pat: match ctx {
+                Ctx::PatIdent(pat) => Some(pat),
+                _ => None,
+            },
+            plan: self.out.plan.get(i).copied().flatten(),
+            diagnosed: self.out.diagnosed.get(i).copied().unwrap_or(false),
+            segs: self.out.segs.split_off(segs0),
+            diags: self.out.diags.split_off(diags0),
+            deferred: self.out.deferred.split_off(deferred0),
+            ident_matches: self.out.ident_matches.split_off(idents0),
+        };
+        if let Some(slot) = self.out.plan.get_mut(i) {
+            *slot = plan0;
+        }
+        if let Some(slot) = self.out.diagnosed.get_mut(i) {
+            *slot = diagnosed0;
+        }
+        let f = ix(self.out.fallbacks.len());
+        self.out.fallbacks.push(fallback);
+        let ctx_t = self.type_ctx.last().copied().unwrap_or(TypeCtx::None);
+        let callee = self.is_callee(p);
+        self.out.deferred.push(Deferred {
+            path: p,
+            kind: DeferKind::Lexical(f),
+            ctx: ctx_t,
+            module: self.module(),
+            callee,
+        });
+    }
+
+    fn resolve_now(&mut self, p: PathId, ctx: Ctx, count: usize, rest: usize) {
         let path = *self.hir.path(p);
         let segs = self.hir.list(path.segments);
         let Some(first) = segs.first().copied() else {
@@ -852,6 +1101,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
         let segs = self.hir.list(path.segments);
         let n = segs.len();
         let ns = path.ns;
+        let callee = self.is_callee(p);
         let mut prev_name = segs.get(from.saturating_sub(1)).map(|s| s.name);
         for k in from..count {
             let Some(seg) = segs.get(k).copied() else {
@@ -859,7 +1109,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
             };
             let last = k + 1 == count && rest == 0;
             let container_name = prev_name.unwrap_or(seg.name);
-            let ts = self.tables_for(ns, !last);
+            let ts = self.tables_for(ns, !last, callee);
             // A program module: its table.
             if cur.kind == DefKind::Module {
                 if let Some(s) = self.m.scope_of(cur.res) {
@@ -950,6 +1200,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
                     },
                     ctx: ctx_t,
                     module: self.module(),
+                    callee,
                 });
                 return;
             }
@@ -1101,7 +1352,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
         prefix: bool,
         seg: usize,
     ) -> Option<Start> {
-        let ts = self.tables_for(ns, prefix);
+        let ts = self.tables_for(ns, prefix, self.is_callee(p));
         let from = self.module();
         for t in ts {
             match self.m.find(s, t, name) {
@@ -1140,7 +1391,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
     /// The kind of a visible item named `name` in a table the path's
     /// namespace does not search (for "expected a type, found function").
     fn probe_other(&self, name: Name, ns: Ns) -> Option<DefKind> {
-        let searched = self.tables_for(ns, false);
+        let searched = self.tables_for(ns, false, false);
         (0..TABLES as u8)
             .filter(|t| !searched.contains(t))
             .filter_map(|t| self.top(t, name))
@@ -1184,8 +1435,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
     }
 
     fn root_hit(&self, name: Name) -> Option<Hit> {
-        if let Ok(i) = self.m.roots.binary_search_by(|(n, _)| n.cmp(&name)) {
-            let u = self.m.roots.get(i)?.1;
+        if let Some(u) = self.m.root_unit(name) {
             let unit = self.m.units.get(u as usize)?;
             return Some(Hit {
                 res: Res::Def(hir_lang::DefId::foreign(
@@ -1227,22 +1477,30 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
     /// A `global` declaration: a global of the unit's root module, or (with
     /// implicit globals) a host global.
     fn global_decl(&mut self, p: PathId, name: Name) -> Start {
-        let t = self.m.policy.table_ix(Namespace::Value);
-        match self.m.find(self.unit.root_scope, t, name) {
-            Some(EntryState::One(b)) => {
-                if let Some(h) = self.hit_of_binding(b) {
-                    return Start::Hit(h);
+        let mut ts: Vec<u8> = Vec::new();
+        for ns in self.m.policy.occupies(ItemClass::Global).iter() {
+            let t = self.m.policy.table_ix(ns);
+            if !ts.contains(&t) {
+                ts.push(t);
+            }
+        }
+        for t in ts {
+            match self.m.find(self.unit.root_scope, t, name) {
+                Some(EntryState::One(b)) => {
+                    if let Some(h) = self.hit_of_binding(b) {
+                        return Start::Hit(h);
+                    }
                 }
+                Some(EntryState::Ambiguous(a, b)) => {
+                    self.ambiguous(p, name, a, b, 0);
+                    return Start::Done;
+                }
+                Some(EntryState::Failed(_)) => {
+                    self.diag(p, DiagKind::BrokenImport { name }, 0, false);
+                    return Start::Done;
+                }
+                None => {}
             }
-            Some(EntryState::Ambiguous(a, b)) => {
-                self.ambiguous(p, name, a, b, 0);
-                return Start::Done;
-            }
-            Some(EntryState::Failed(_)) => {
-                self.diag(p, DiagKind::BrokenImport { name }, 0, false);
-                return Start::Done;
-            }
-            None => {}
         }
         if self.m.policy.implicit_globals() {
             self.seg_ref(p, 0, Res::Extern(name.sym), NONE);
@@ -1256,6 +1514,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
     /// the prelude.
     fn first(&mut self, p: PathId, ctx: Ctx, name: Name, prefix: bool) -> Start {
         let ns = self.hir.path(p).ns;
+        let callee = self.is_callee(p);
         let mut best: Option<((u32, u32), Cand)> = None;
         if ns != Ns::Import {
             if let Some(b) = self.hir.lookup_local(p, name) {
@@ -1269,7 +1528,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
                 }
             }
         }
-        for t in self.tables_for(ns, prefix) {
+        for t in self.tables_for(ns, prefix, callee) {
             let Some(e) = self.top(t, name) else { continue };
             let key = (e.depth, e.seq);
             if best.is_none_or(|(k, _)| key > k) {
@@ -1316,7 +1575,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
                         return Start::Hit(h);
                     }
                 }
-                let ts = self.tables_for(ns, prefix);
+                let ts = self.tables_for(ns, prefix, callee);
                 self.prelude_hit(name, &ts)
                     .map_or(Start::Unresolved, Start::Hit)
             }
@@ -1405,7 +1664,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
     // -------------------------------------------------------- suggestions
 
     fn suggest_first(&mut self, p: PathId, name: Name, ns: Ns) -> Option<Name> {
-        if !self.sugg.has_budget() {
+        if self.quiet || !self.sugg.has_budget() {
             return None;
         }
         let mut cands: Vec<Name> = Vec::new();
@@ -1440,7 +1699,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
             {
                 continue;
             }
-            cands.extend(scope.table.iter().map(|e| e.name).take(MAX_CANDIDATES));
+            cands.extend(scope.table.iter().map(|e| e.spelling).take(MAX_CANDIDATES));
         }
         cands.extend(self.m.roots.iter().map(|(n, _)| *n).take(MAX_CANDIDATES));
         if self.env_names.is_none() {
@@ -1467,7 +1726,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
     }
 
     fn suggest_in(&mut self, s: u32, name: Name) -> Option<Name> {
-        if !self.sugg.has_budget() {
+        if self.quiet || !self.sugg.has_budget() {
             return None;
         }
         let from = self.module();
@@ -1483,7 +1742,7 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
                     _ => false,
                 };
                 if visible {
-                    cands.push(e.name);
+                    cands.push(e.spelling);
                 }
             }
         }
@@ -1491,6 +1750,43 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
         cands.dedup();
         self.sugg.best(self.names, name, &cands)
     }
+}
+
+/// The table indexes a path segment searches, in order: the module and type
+/// tables for a prefix; for a value, the function table first when it is a
+/// callee and the constant table first otherwise (one table unless the
+/// policy keeps constants apart).
+pub(crate) fn tables_for(
+    policy: &crate::policy::Policy,
+    ns: Ns,
+    prefix: bool,
+    callee: bool,
+) -> Vec<u8> {
+    let list: &[Namespace] = if prefix {
+        &[Namespace::Module, Namespace::Type]
+    } else {
+        match ns {
+            Ns::Value if callee => &[Namespace::Value, Namespace::Const],
+            Ns::Value | Ns::Pattern => &[Namespace::Const, Namespace::Value],
+            Ns::Type => &[Namespace::Type],
+            Ns::Region => &[],
+            Ns::Import => &[
+                Namespace::Value,
+                Namespace::Type,
+                Namespace::Module,
+                Namespace::Macro,
+                Namespace::Const,
+            ],
+        }
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for ns in list {
+        let t = policy.table_ix(*ns);
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
 }
 
 /// How a first segment started.
@@ -1570,6 +1866,7 @@ mod tests {
             deferred: Vec::new(),
             diags: Vec::new(),
             ident_matches: Vec::new(),
+            fallbacks: Vec::new(),
         };
         let p = PathId::from_index(1).unwrap();
         let unit = hir_lang::UnitId::new(0);

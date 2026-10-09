@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b937a51fed71ef1060fc7c214feb29e4966787b09312f2ae103aa8640803d705 # shrinks to p = Prog { classes: [Class { bases: [], members: [None, None, None] }, Class { bases: [0, 0], members: [None, None, None] }], top: [false, false, false, false] }
+cc adf2fb54ccd33aaceba09e9bfa0c412a06fffa46fc18d5aebbecb1d7ee48bbcf # shrinks to p = Prog { classes: [Class { bases: [], members: [Some(2), None, None] }, Class { bases: [], members: [Some(0), None, None] }, Class { bases: [0, 1], members: [None, None, None] }], top: [false, false, false, false] }

@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, two dependencies from the family: <a href="https://crates.io/crates/hir-lang"><code>hir-lang</code></a> and <a href="https://crates.io/crates/intern-lang"><code>intern-lang</code></a>.
     </p>
     <blockquote>
-        <strong>Status: 0.2.0, pre-1.0.</strong> The public API is designed across the 0.x series and frozen at <code>1.0.0</code>, after the LexerSketch LSP drives go-to-definition and rename through it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: 0.3.0, pre-1.0.</strong> The public API is designed across the 0.x series and frozen at <code>1.0.0</code>, after the LexerSketch LSP drives go-to-definition and rename through it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -51,7 +51,9 @@ What it guarantees, and how each guarantee is checked:
 | Guarantee | How it is held |
 |---|---|
 | Lexical resolution is right: the innermost visible binder or item wins, hoisting and frames included. | Property tests compare it with a separate reference resolver (a stack of scopes searched innermost-out) on random programs of nested blocks, items, closures, and parameters, under scope hoisting and under declare-before-use. |
-| Imports reach the least fixpoint of their rules, whatever the order. | Property tests compare it with a naive fixpoint over random module graphs of definitions, aliased imports, and globs, public and private, with cycles and ambiguity; a second property permutes the modules and checks that nothing changes. |
+| Imports reach the least fixpoint of their rules, whatever the order. | Property tests compare it with a naive fixpoint over random module graphs of definitions, aliased imports, and globs, public and private, with cycles and ambiguity; a second property permutes the modules and checks that nothing changes. A third compares relative imports whose first segment arrives only through a glob (or falls back to the enclosing module) with a naive fixpoint over per-table slots. |
+| PHP's name tables: functions, methods, and classes fold ASCII case; constants keep case in a table of their own. | A property test compares PHP resolution with a reference made of plain maps on random programs of functions, constants, class members, and calls spelled in random case. |
+| Several bases follow C3 (Python's MRO); a class's unqualified names see inherited members. | Property tests compare member lookup and lexical inheritance with a textbook C3 reference on random hierarchies with public, protected, and private members; inconsistent hierarchies are counted and must be reported. |
 | Every reference ends resolved, or with exactly one diagnostic. | Checked by the property tests on every random program; access errors keep their resolution and carry one diagnostic. |
 | The result is a valid `Hir`. | Every resolution goes through `Hir::resolve_partial`; a refusal becomes `Res::Err` and a diagnostic. The tests validate the result again. |
 | The index is consistent: a definition lists exactly the references that point at it. | Checked by the property tests on every random program. |
@@ -65,7 +67,7 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-resolve-lang = "0.2"
+resolve-lang = "0.3"
 hir-lang = "0.3"
 intern-lang = "1"
 ```
@@ -74,7 +76,7 @@ Without the standard library:
 
 ```toml
 [dependencies]
-resolve-lang = { version = "0.2", default-features = false }
+resolve-lang = { version = "0.3", default-features = false }
 ```
 
 <hr>
@@ -183,7 +185,54 @@ assert_eq!(index.resolve_at(UnitId::new(2), path, 1), Some(def));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-More in [`examples/`](./examples): `basic` (the lazy path), `multi_unit` (two units importing each other), `lsp` (go-to-definition, references, rename, outline).
+### PHP's tables and Python's MRO
+
+```rust
+use hir_lang::{Builder, Expr, Name};
+use intern_lang::Interner;
+use resolve_lang::{Policy, Resolver};
+
+// function strLen() {}   const config = 1;   function config() {}
+// function main() { STRLEN(); config(); config; }
+let mut names = Interner::new();
+let mut b = Builder::new();
+let body = b.block(&[], None);
+let strlen = b.func(Name::new(names.intern("strLen")), &[], body);
+let one = b.int(1);
+let config = Name::new(names.intern("config"));
+let k = b.item(hir_lang::Item::new(Some(config), hir_lang::ItemKind::Const { ty: None, value: Some(one) }));
+let body = b.block(&[], None);
+let f = b.func(config, &[], body);
+let c1 = b.name_expr(Name::new(names.intern("STRLEN")));
+let call1 = b.call(c1, &[]);
+let c2 = b.name_expr(config);
+let call2 = b.call(c2, &[]);
+let value = b.name_expr(config);
+let list = b.list(&[call1, call2, value]);
+let t = b.expr(Expr::Tuple(list));
+let main_body = b.block(&[], Some(t));
+let main = b.func(Name::new(names.intern("main")), &[], main_body);
+let root = b.module(None, &[strlen, k, f, main]);
+let hir = b.finish(root)?;
+let unit = hir.unit();
+
+let res = Resolver::new(Policy::php()).resolve(hir, &names)?;
+// No duplicate (a function and a constant may share a name), nothing unresolved.
+assert!(res.is_clean());
+let hir = res.hir(unit).unwrap();
+let target = |e| match *hir.expr(e) { Expr::Call { callee, .. } => callee, _ => e };
+let res_of = |e| match *hir.expr(target(e)) { Expr::Path(p) => hir.path(p).res, _ => unreachable!() };
+assert_eq!(res_of(call1), hir_lang::Res::Def(hir.def(hir_lang::Def::Item(strlen))));
+assert_eq!(res_of(call2), hir_lang::Res::Def(hir.def(hir_lang::Def::Item(f))));
+assert_eq!(res_of(value), hir_lang::Res::Def(hir.def(hir_lang::Def::Item(k))));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Under `Policy::python()`, a class `C(A, B)` looks members up in C3 order
+(`C, A, B, …`), and a hierarchy with no consistent order is reported, as Python
+raises `TypeError`; see the `php_python` example.
+
+More in [`examples/`](./examples): `basic` (the lazy path), `multi_unit` (two units importing each other), `lsp` (go-to-definition, references, rename, outline), `php_python` (PHP's tables and case folding, Python's C3 order).
 
 <hr>
 <br>
@@ -192,11 +241,13 @@ More in [`examples/`](./examples): `basic` (the lazy path), `multi_unit` (two un
 
 - **Binders** through `Hir::lookup_local` and the walk's `Bind`/`Scope`/`Frame` events: the HIR's own scope rules, never re-derived. A local behind a frame it cannot cross (a nested function) is reported, not silently skipped.
 - **Items** by namespace and hoisting: visible in their whole scope, from their declaration on, or (PHP) in their whole module wherever declared.
+- **Case folding** per table: PHP 8's ASCII rule for functions, methods, classes, and namespaces, through every lookup; names stay as written in diagnostics and the index, and a rename covers every case variant.
+- **Constants apart from functions** (PHP): a call's callee searches functions first, any other value constants first, so a method and a class constant may share a name.
 - **Paths**: `a::b::c` through modules, sum variants, and the environment's containers; partial resolution where the rest is type-directed (`Vec::new`, `T::Item`, `<T as Tr>::Out`); roots `::`, `self::`, `super::`; `self::`/`parent::`/`static::` early or late per policy.
 - **Imports**: single, aliased, glob, re-exported, private, across units, in cycles; ambiguity between globs reported where the name is used.
 - **Patterns**: a bare identifier pattern matches a constant, unit variant, or unit record of that name, and binds otherwise.
-- **Classes**: member tables with mixin expansion (`insteadof`, `as`), inherited lookups, private and protected access.
-- **Diagnostics**: unresolved names (with a suggestion within a small edit distance), ambiguous globs, private access, duplicates, uncapturable locals, wrong kinds, import cycles, mixin conflicts.
+- **Classes**: member tables with mixin expansion (`insteadof`, `as`, matched case-insensitively under PHP), inherited lookups in C3 order (Python's MRO), private and protected access; under lexical class scoping, unqualified names see inherited members before enclosing scopes.
+- **Diagnostics**: unresolved names (with a suggestion within a small edit distance), ambiguous globs, private access, duplicates, uncapturable locals, wrong kinds, import cycles, mixin conflicts, inconsistent method resolution orders.
 
 <hr>
 <br>
@@ -207,10 +258,12 @@ Measured with `cargo bench --bench bench` on a desktop x86_64 machine (Windows, 
 
 | Benchmark | Size | Time |
 |---|---|---|
-| One unit, functions with locals and calls | 124,000 nodes | 24.6 ms |
-| One unit, functions with locals and calls | 1,240,000 nodes | 317 ms |
-| 1,000 modules in a glob ring, aliased imports | 53,000 nodes | 19.9 ms |
-| Eight units, each calling into the next | 992,000 nodes | 263 ms |
+| One unit, functions with locals and calls | 124,000 nodes | 22.3 ms |
+| One unit, functions with locals and calls | 1,240,000 nodes | 219 ms |
+| The same unit under `Policy::php()`, every call found through case folding | 1,240,000 nodes | 215 ms |
+| 1,000 modules in a glob ring, aliased imports | 53,000 nodes | 12.1 ms |
+| Eight units, each calling into the next | 992,000 nodes | 160 ms |
+| 10,000 classes with three bases each (C3), inherited members named unqualified and through the class | 219,000 nodes | 97 ms |
 
 These are library numbers: the time includes building the index and writing every resolution into the `Hir`.
 
@@ -225,7 +278,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo bench --bench bench
 ```
 
-The property tests in [`tests/properties.rs`](./tests/properties.rs) and [`tests/import_graph.rs`](./tests/import_graph.rs) hold the resolver to independent references written in the tests. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
+The property tests in [`tests/properties.rs`](./tests/properties.rs), [`tests/import_graph.rs`](./tests/import_graph.rs), [`tests/import_corner.rs`](./tests/import_corner.rs), [`tests/case_fold.rs`](./tests/case_fold.rs), and [`tests/inheritance.rs`](./tests/inheritance.rs) hold the resolver to independent references written in the tests. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
 
 <hr>
 <br>

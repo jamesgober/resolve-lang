@@ -21,14 +21,26 @@
 //! - Glob propagation is a worklist of slot changes; each slot changes a
 //!   bounded number of times, so its cost is bounded by the slots it fills,
 //!   which the [`Budget`](crate::Budget) caps.
-//! - When nothing can make progress, every remaining wait is on a slot that
-//!   nothing will fill, except where a lexical first segment could fall back
-//!   to an outer scope, a root, or the prelude. Then the lowest-numbered
-//!   waiting import is settled in *final mode* (a miss in a scope with globs
-//!   counts as absent, a name another waiting import binds counts as a
-//!   cycle), the worklist runs again, and so on. Imports settled that way
-//!   are rechecked at the end and reported if the finished tables would
-//!   resolve them differently.
+//! - When nothing can make progress, every remaining wait is either on a
+//!   slot only glob imports could still fill (*glob-blocked*: a lexical
+//!   first segment could fall back to an outer scope, a root, or the
+//!   prelude), or on a slot a waiting named import binds (*import-blocked*).
+//!   A name is *producible* while a waiting named import of that name, or any
+//!   waiting glob, could still create a slot for it (new slots come from
+//!   nowhere else). A glob-blocked import is settled first: the
+//!   lowest-numbered one whose wait is on an unproducible name, in *exact
+//!   final mode* (a miss in a scope with globs counts as absent only for an
+//!   unproducible name; a producible one is still waited for), so its
+//!   fallback is exact; when there is none, the lowest-numbered glob-blocked
+//!   import, in *forced final mode* (every such miss counts as absent). In
+//!   both, a name a waiting named import binds is still waited for (the
+//!   import becomes import-blocked). Only when every wait is import-blocked
+//!   (a true cycle) is the lowest-numbered one settled in *cycle mode*, where
+//!   such a name is a cycle. Then the worklist runs again, and so on. The
+//!   order matters: an import must not be failed as a cycle, or settled
+//!   through a fallback, while what it waits for could still be settled
+//!   exactly. Imports settled in a final mode are rechecked at the end and
+//!   reported if the finished tables would resolve them differently.
 //!
 //! Every step is deterministic: queues are FIFO in import order and every map
 //! is ordered.
@@ -49,7 +61,7 @@ use crate::{
         ANY_NS, Binding, Entry, EntryState, ImportState, Model, NONE, Origin, ScopeKind,
         entry_order, ix,
     },
-    policy::{Hoist, ItemClass, ModuleScope, Namespace, min_vis, vis_rank},
+    policy::{Hoist, ItemClass, ModuleScope, Namespace, TABLES, min_vis, vis_rank},
     suggest::{MAX_CANDIDATES, Suggester},
 };
 
@@ -79,12 +91,32 @@ enum Slot {
     Top(u32, u32),
 }
 
+/// How far an import attempt may give up waiting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Finality {
+    /// Wait for every undetermined slot.
+    Normal,
+    /// A miss in a scope whose globs are undetermined is absent if no
+    /// waiting import could still produce the name.
+    Exact,
+    /// Every such miss is absent.
+    Forced,
+    /// As forced, and a name a waiting named import binds is a cycle.
+    Cycle,
+}
+
 /// How a lookup treats undetermined names, and which import is asking (an
 /// import never resolves through itself).
 #[derive(Clone, Copy, Debug)]
 struct Mode {
-    final_mode: bool,
+    fin: Finality,
     skip: u32,
+}
+
+impl Mode {
+    const fn cycles(self) -> bool {
+        matches!(self.fin, Finality::Cycle)
+    }
 }
 
 /// One table lookup's answer.
@@ -159,17 +191,34 @@ struct Task {
 }
 
 struct Work {
+    /// Per scope: unshadowed definitions, sorted by (table, key).
     defs: Vec<Vec<u32>>,
+    /// Per scope: named imports by fully folded name (every spelling some
+    /// table could treat as equal), then import index.
     named_names: Vec<Vec<(Name, u32)>>,
     named_res: Vec<BTreeMap<(u8, Name), GState>>,
     glob_res: Vec<BTreeMap<(u8, Name), GState>>,
     importers: Vec<Vec<(u32, u32)>>,
-    /// Pending imports waiting for a slot to fill.
+    /// Pending imports waiting for a slot to fill, by (scope, fully folded
+    /// name): a wake for one spelling may wake a case variant too, which
+    /// only costs a re-attempt (attempts are pure).
     waiters: BTreeMap<(u32, Name), Vec<u32>>,
-    /// Resolved imports whose path read a slot (woken whenever it changes).
+    /// Resolved imports whose path read a slot (woken whenever it changes),
+    /// keyed like `waiters`.
     subs: BTreeMap<(u32, Name), Vec<u32>>,
     queue: VecDeque<u32>,
-    stuck: BTreeSet<u32>,
+    /// Waiting imports whose slot only glob imports could still fill.
+    stuck_globs: BTreeSet<u32>,
+    /// Waiting imports whose slot a waiting named import binds.
+    stuck_imports: BTreeSet<u32>,
+    /// For glob-blocked imports: the fully folded name they wait for.
+    waiting_on: BTreeMap<u32, Name>,
+    /// Pending named imports by fully folded name (counts), and pending glob
+    /// imports: what could still produce a new slot.
+    pending_named: BTreeMap<Name, u32>,
+    pending_globs: u32,
+    /// Named-import bindings: the binding each one copies (for the index).
+    sources: BTreeMap<u32, u32>,
     tasks: VecDeque<Task>,
     budget: u64,
     /// Imports that ended ⊤ (named) or were found ambiguous after the fact
@@ -194,7 +243,12 @@ pub(crate) fn resolve_imports<L: Lookup>(
         waiters: BTreeMap::new(),
         subs: BTreeMap::new(),
         queue: VecDeque::new(),
-        stuck: BTreeSet::new(),
+        stuck_globs: BTreeSet::new(),
+        stuck_imports: BTreeSet::new(),
+        waiting_on: BTreeMap::new(),
+        pending_named: BTreeMap::new(),
+        pending_globs: 0,
+        sources: BTreeMap::new(),
         tasks: VecDeque::new(),
         budget: glob_budget,
         top: alloc::vec![false; m.imports.len()],
@@ -206,7 +260,7 @@ pub(crate) fn resolve_imports<L: Lookup>(
             .copied()
             .filter(|b| m.bindings.get(*b as usize).is_some_and(|b| !b.shadowed))
             .collect();
-        defs.sort_by_key(|b| m.bindings.get(*b as usize).map(|b| (b.ns, b.name)));
+        defs.sort_by_key(|b| m.bindings.get(*b as usize).map(|b| (b.ns, b.key)));
         w.defs.push(defs);
         let mut named: Vec<(Name, u32)> = s
             .named
@@ -214,7 +268,7 @@ pub(crate) fn resolve_imports<L: Lookup>(
             .filter_map(|i| {
                 m.imports
                     .get(*i as usize)
-                    .and_then(|imp| imp.name.map(|n| (n, *i)))
+                    .and_then(|imp| imp.name.map(|n| (m.fold.name(n), *i)))
             })
             .collect();
         named.sort();
@@ -223,6 +277,11 @@ pub(crate) fn resolve_imports<L: Lookup>(
     for (i, imp) in m.imports.iter().enumerate() {
         if imp.state == ImportState::Pending {
             w.queue.push_back(ix(i));
+            if imp.glob {
+                w.pending_globs += 1;
+            } else if let Some(n) = imp.name {
+                *w.pending_named.entry(m.fold.name(n)).or_insert(0) += 1;
+            }
         }
     }
     loop {
@@ -239,16 +298,28 @@ pub(crate) fn resolve_imports<L: Lookup>(
                 }
                 _ => continue,
             };
-            let final_mode = recheck && imp.late;
-            let attempt = attempt(m, &w, i, final_mode);
-            settle(m, &mut w, names, suggester, i, attempt, final_mode, recheck)?;
+            let fin = if recheck && imp.late {
+                Finality::Cycle
+            } else {
+                Finality::Normal
+            };
+            let attempt = attempt(m, &w, i, fin);
+            settle(m, &mut w, names, suggester, i, attempt, fin, recheck)?;
         }
-        let Some(i) = w.stuck.pop_first() else { break };
+        // Stuck: settle a glob-blocked import first; only a true cycle of
+        // named imports is broken in cycle mode.
+        let (i, fin) = if let Some(pick) = pick_glob_blocked(&mut w)? {
+            pick
+        } else if let Some(i) = w.stuck_imports.pop_first() {
+            (i, Finality::Cycle)
+        } else {
+            break;
+        };
         if m.imports.get(i as usize).map(|imp| imp.state) != Some(ImportState::Pending) {
             continue;
         }
-        let attempt = attempt(m, &w, i, true);
-        settle(m, &mut w, names, suggester, i, attempt, true, false)?;
+        let attempt = attempt(m, &w, i, fin);
+        settle(m, &mut w, names, suggester, i, attempt, fin, false)?;
     }
     report_top(m, &w);
     recheck_late(m, &w);
@@ -266,9 +337,11 @@ fn settle<L: Lookup>(
     suggester: &mut Suggester,
     i: u32,
     attempt: Attempt,
-    final_mode: bool,
+    fin: Finality,
     recheck: bool,
 ) -> Result<(), ResolveError> {
+    let final_mode = fin != Finality::Normal;
+    let cycles = fin == Finality::Cycle;
     match attempt {
         Attempt::Named {
             slots,
@@ -280,7 +353,7 @@ fn settle<L: Lookup>(
                 return merge(m, w, i, &slots, false);
             }
             report_private(m, i, private);
-            subscribe(w, i, &deps);
+            subscribe(m, w, i, &deps);
             install_named(m, w, i, &slots, segs, final_mode)?;
         }
         Attempt::Glob {
@@ -294,12 +367,19 @@ fn settle<L: Lookup>(
                 return Ok(());
             }
             report_private(m, i, private);
-            subscribe(w, i, &deps);
+            subscribe(m, w, i, &deps);
             install_glob(m, w, i, container, res, segs, final_mode)?;
         }
-        Attempt::Wait(s, name) if !final_mode && !recheck => {
-            w.waiters.entry((s, name)).or_default().push(i);
-            let _new = w.stuck.insert(i);
+        Attempt::Wait(s, name) if !cycles && !recheck => {
+            let folded = m.fold.name(name);
+            w.waiters.entry((s, folded)).or_default().push(i);
+            let on_import = import_blocked(m, w, s, folded, i);
+            let _new = if on_import {
+                w.stuck_imports.insert(i)
+            } else {
+                let _prev = w.waiting_on.insert(i, folded);
+                w.stuck_globs.insert(i)
+            };
         }
         Attempt::Wait(..) if recheck => {}
         Attempt::Wait(..) => {
@@ -348,9 +428,85 @@ fn settle<L: Lookup>(
     Ok(())
 }
 
-fn subscribe(w: &mut Work, i: u32, deps: &[(u32, Name)]) {
-    for &d in deps {
-        w.subs.entry(d).or_default().push(i);
+/// Whether the slot (`s`, `folded`) that import `i` waits on is bound by a
+/// waiting named import (not just undetermined because of globs).
+fn import_blocked(m: &Model<'_>, w: &Work, s: u32, folded: Name, i: u32) -> bool {
+    let named = w.named_names.get(s as usize).map_or(&[][..], Vec::as_slice);
+    let lo = named.partition_point(|(n, _)| *n < folded);
+    named
+        .get(lo..)
+        .unwrap_or(&[])
+        .iter()
+        .take_while(|(n, _)| *n == folded)
+        .any(|(_, j)| {
+            *j != i && m.imports.get(*j as usize).map(|imp| imp.state) == Some(ImportState::Pending)
+        })
+}
+
+/// Import `i` settled: it is no longer stuck, and no longer a producer of
+/// new slots.
+fn unstick(m: &Model<'_>, w: &mut Work, i: u32) {
+    let _a = w.stuck_globs.remove(&i);
+    let _b = w.stuck_imports.remove(&i);
+    let _c = w.waiting_on.remove(&i);
+    let Some(imp) = m.imports.get(i as usize) else {
+        return;
+    };
+    if imp.glob {
+        w.pending_globs = w.pending_globs.saturating_sub(1);
+    } else if let Some(n) = imp.name {
+        let key = m.fold.name(n);
+        if let Some(c) = w.pending_named.get_mut(&key) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                let _gone = w.pending_named.remove(&key);
+            }
+        }
+    }
+}
+
+/// The glob-blocked import to settle next, and how: the lowest-numbered one
+/// waiting on a name nothing pending could still produce (exact final
+/// mode), else the lowest-numbered (forced final mode). The scan is charged
+/// to the glob budget.
+fn pick_glob_blocked(w: &mut Work) -> Result<Option<(u32, Finality)>, ResolveError> {
+    let mut exact = None;
+    if w.pending_globs == 0 {
+        for &i in &w.stuck_globs {
+            if w.budget == 0 {
+                return Err(ResolveError::BudgetExceeded {
+                    limit: Limit::GlobBindings,
+                });
+            }
+            w.budget -= 1;
+            let fillable = w
+                .waiting_on
+                .get(&i)
+                .is_some_and(|n| w.pending_named.contains_key(n));
+            if !fillable {
+                exact = Some(i);
+                break;
+            }
+        }
+    }
+    let pick = exact
+        .map(|i| (i, Finality::Exact))
+        .or_else(|| w.stuck_globs.first().map(|i| (*i, Finality::Forced)));
+    if let Some((i, _)) = pick {
+        let _was = w.stuck_globs.remove(&i);
+        let _name = w.waiting_on.remove(&i);
+    }
+    Ok(pick)
+}
+
+/// Whether a waiting import could still create a slot named `name`.
+fn producible(m: &Model<'_>, w: &Work, name: Name) -> bool {
+    w.pending_globs > 0 || w.pending_named.contains_key(&m.fold.name(name))
+}
+
+fn subscribe(m: &Model<'_>, w: &mut Work, i: u32, deps: &[(u32, Name)]) {
+    for &(s, name) in deps {
+        w.subs.entry((s, m.fold.name(name))).or_default().push(i);
     }
 }
 
@@ -406,26 +562,27 @@ fn fail<L: Lookup>(
     imp.res = Res::Err;
     imp.unresolved = 0;
     let (scope, name) = (imp.scope, imp.name);
-    let _was = w.stuck.remove(&i);
+    unstick(m, w, i);
     if let Some((unit, span, path)) = seg_site(m, i, f.seg) {
         m.report(unit, f.kind, span, Some(NodeRef::Path(path)));
     }
     if let Some(name) = name {
-        wake(w, scope, name);
+        wake(w, scope, m.fold.name(name));
     }
 }
 
-/// A slot of `scope` named `name` filled: wake the imports waiting for it.
-fn wake(w: &mut Work, scope: u32, name: Name) {
-    if let Some(list) = w.waiters.remove(&(scope, name)) {
+/// A slot of `scope` named `folded` (a fully folded name) filled: wake the
+/// imports waiting for it.
+fn wake(w: &mut Work, scope: u32, folded: Name) {
+    if let Some(list) = w.waiters.remove(&(scope, folded)) {
         w.queue.extend(list);
     }
 }
 
-/// A slot of `scope` named `name` changed: re-evaluate the resolved imports
-/// that read it (they may bind another table now, or turn ⊤).
-fn wake_subs(w: &mut Work, scope: u32, name: Name) {
-    if let Some(list) = w.subs.get(&(scope, name)) {
+/// A slot of `scope` named `folded` changed: re-evaluate the resolved
+/// imports that read it (they may bind another table now, or turn ⊤).
+fn wake_subs(w: &mut Work, scope: u32, folded: Name) {
+    if let Some(list) = w.subs.get(&(scope, folded)) {
         w.queue.extend(list.iter().copied());
     }
 }
@@ -439,11 +596,16 @@ fn candidates(m: &Model<'_>, w: &Work, near: Near, out: &mut Vec<Name>) {
                 out.push(b.name);
             }
         }
-        for (n, _) in w.named_names.get(scope).into_iter().flatten() {
-            out.push(*n);
+        for (_, i) in w.named_names.get(scope).into_iter().flatten() {
+            if let Some(n) = m.imports.get(*i as usize).and_then(|imp| imp.name) {
+                out.push(n);
+            }
         }
-        for (_, n) in w.glob_res.get(scope).into_iter().flat_map(|g| g.keys()) {
-            out.push(*n);
+        for g in w.glob_res.get(scope).into_iter().flat_map(|g| g.values()) {
+            let (GState::One(b) | GState::Amb { a: b, .. }) = *g;
+            if let Some(b) = m.bindings.get(b as usize) {
+                out.push(b.name);
+            }
         }
     };
     match near {
@@ -501,11 +663,12 @@ fn tables(m: &Model<'_>, all: bool) -> Vec<u8> {
             Namespace::Type,
             Namespace::Module,
             Namespace::Macro,
+            Namespace::Const,
         ]
     } else {
         &[Namespace::Module, Namespace::Type]
     };
-    let mut out: Vec<u8> = Vec::with_capacity(4);
+    let mut out: Vec<u8> = Vec::with_capacity(5);
     for ns in list {
         let t = m.policy.table_ix(*ns);
         if !out.contains(&t) {
@@ -515,27 +678,45 @@ fn tables(m: &Model<'_>, all: bool) -> Vec<u8> {
     out
 }
 
-/// The definition of `key` in scope `s` (the last one, under `LastWins`).
+/// The definition of `key` (a table and a key in it) in scope `s` (the last
+/// one, under `LastWins`).
 fn def_in(m: &Model<'_>, w: &Work, s: u32, key: (u8, Name)) -> Option<u32> {
     let defs = w.defs.get(s as usize)?;
     let upper = defs.partition_point(|b| {
         m.bindings
             .get(*b as usize)
-            .is_some_and(|b| (b.ns, b.name) <= key)
+            .is_some_and(|b| (b.ns, b.key) <= key)
     });
     let b = *defs.get(upper.checked_sub(1)?)?;
     m.bindings
         .get(b as usize)
-        .is_some_and(|x| (x.ns, x.name) == key)
+        .is_some_and(|x| (x.ns, x.key) == key)
         .then_some(b)
 }
 
-/// The named imports of `name` in scope `s`.
-fn named_of(w: &Work, s: u32, name: Name) -> &[(Name, u32)] {
+/// The named imports of scope `s` whose name has key `key` in table `t`.
+fn named_of<'w>(
+    m: &'w Model<'_>,
+    w: &'w Work,
+    s: u32,
+    t: u8,
+    key: Name,
+) -> impl Iterator<Item = u32> + 'w {
+    let folded = m.fold.name(key);
     let named = w.named_names.get(s as usize).map_or(&[][..], Vec::as_slice);
-    let lo = named.partition_point(|(n, _)| *n < name);
-    let hi = named.partition_point(|(n, _)| *n <= name);
-    named.get(lo..hi).unwrap_or(&[])
+    let lo = named.partition_point(|(n, _)| *n < folded);
+    let hi = named.partition_point(|(n, _)| *n <= folded);
+    named
+        .get(lo..hi)
+        .unwrap_or(&[])
+        .iter()
+        .map(|(_, i)| *i)
+        .filter(move |i| {
+            m.imports
+                .get(*i as usize)
+                .and_then(|imp| imp.name)
+                .is_some_and(|n| m.fold.key(t, n) == key)
+        })
 }
 
 const fn as_lookup(g: GState) -> L {
@@ -547,28 +728,23 @@ const fn as_lookup(g: GState) -> L {
 
 /// Looks `name` up in one table of scope `s`, during import resolution.
 fn lookup(m: &Model<'_>, w: &Work, s: u32, t: u8, name: Name, mode: Mode) -> L {
-    let key = (t, name);
+    let key = (t, m.fold.key(t, name));
     if let Some(b) = def_in(m, w, s, key) {
         return L::Found(b);
     }
     // An import never resolves through itself (`import os` looks past its
     // own binding of `os`).
-    let same = named_of(w, s, name);
-    if same.iter().any(|(_, i)| *i != mode.skip) {
+    let others = || named_of(m, w, s, t, key.1).filter(|i| *i != mode.skip);
+    if others().next().is_some() {
         if let Some(&g) = w.named_res.get(s as usize).and_then(|r| r.get(&key)) {
             return as_lookup(g);
         }
         let state = |i: u32| m.imports.get(i as usize).map(|imp| imp.state);
-        let others = || same.iter().filter(|(_, i)| *i != mode.skip);
-        if others().any(|(_, i)| state(*i) == Some(ImportState::Pending)) {
-            return if mode.final_mode {
-                L::Cycle
-            } else {
-                L::Pending
-            };
+        if others().any(|i| state(i) == Some(ImportState::Pending)) {
+            return if mode.cycles() { L::Cycle } else { L::Pending };
         }
-        let failed = others().any(|(_, i)| state(*i) == Some(ImportState::Failed));
-        let done = others().any(|(_, i)| state(*i) == Some(ImportState::Done));
+        let failed = others().any(|i| state(i) == Some(ImportState::Failed));
+        let done = others().any(|i| state(i) == Some(ImportState::Done));
         return if failed && !done {
             L::Failed
         } else {
@@ -582,7 +758,12 @@ fn lookup(m: &Model<'_>, w: &Work, s: u32, t: u8, name: Name, mode: Mode) -> L {
         .scopes
         .get(s as usize)
         .is_some_and(|s| !s.globs.is_empty());
-    if has_globs && !mode.final_mode {
+    let wait = match mode.fin {
+        Finality::Normal => true,
+        Finality::Exact => producible(m, w, name),
+        Finality::Forced | Finality::Cycle => false,
+    };
+    if has_globs && wait {
         L::Pending
     } else {
         L::NotFound
@@ -670,8 +851,7 @@ fn lookup_tables(
 
 /// A root name: a program unit, else the environment's root.
 fn root_hit(m: &Model<'_>, name: Name) -> Option<Hit> {
-    if let Ok(i) = m.roots.binary_search_by(|(n, _)| n.cmp(&name)) {
-        let u = m.roots.get(i)?.1;
+    if let Some(u) = m.root_unit(name) {
         let unit = m.units.get(u as usize)?;
         return Some(Hit {
             res: Res::Def(hir_lang::DefId::foreign(
@@ -975,11 +1155,8 @@ fn top_everywhere(m: &Model<'_>, a: u32, b: u32) -> Vec<(u8, Slot)> {
 }
 
 /// Tries to resolve import `i` against the current state. Pure: reads only.
-fn attempt(m: &Model<'_>, w: &Work, i: u32, final_mode: bool) -> Attempt {
-    let mode = Mode {
-        final_mode,
-        skip: i,
-    };
+fn attempt(m: &Model<'_>, w: &Work, i: u32, fin: Finality) -> Attempt {
+    let mode = Mode { fin, skip: i };
     let fail0 = |kind| {
         Attempt::Fail(Fail {
             kind,
@@ -1182,9 +1359,11 @@ fn import_binding(m: &mut Model<'_>, i: u32, t: u8, name: Name, src: Hit) -> u32
         .map_or((NONE, Vis::Private), |imp| (imp.scope, imp.vis));
     let span = import_span(m, i);
     let hoist = import_hoist(m);
+    let key = m.fold.key(t, name);
     m.push_binding(Binding {
         ns: t,
         name,
+        key,
         res: src.res,
         kind: src.kind,
         vis,
@@ -1231,7 +1410,7 @@ fn install_named(
     } else {
         Vec::new()
     };
-    let _was = w.stuck.remove(&i);
+    unstick(m, w, i);
     merge(m, w, i, slots, true)
 }
 
@@ -1253,7 +1432,7 @@ fn merge(
     let span = import_span(m, i);
     let mut changed = false;
     for &(t, slot) in slots {
-        let key = (t, name);
+        let key = (t, m.fold.key(t, name));
         let current = w
             .named_res
             .get(s as usize)
@@ -1284,7 +1463,11 @@ fn merge(
             continue;
         }
         let next = match (current, slot) {
-            (None, Slot::Hit(h)) => GState::One(import_binding(m, i, t, name, h)),
+            (None, Slot::Hit(h)) => {
+                let b = import_binding(m, i, t, name, h);
+                let _new = w.sources.insert(b, h.binding);
+                GState::One(b)
+            }
             (None, Slot::Top(a, b)) => GState::Amb {
                 a: witness(m, i, t, name, a),
                 b: witness(m, i, t, name, b),
@@ -1306,25 +1489,50 @@ fn merge(
         announce(w, s, next);
         changed = true;
     }
+    let folded = m.fold.name(name);
     if first || changed {
-        wake(w, s, name);
+        wake(w, s, folded);
     }
     if changed {
-        // The path keeps a resolution while some table still has one
-        // meaning; once every table is ⊤ it is an error (reported at the end).
-        let any_one = (0..5u8).any(|t| {
-            matches!(
-                w.named_res.get(s as usize).and_then(|r| r.get(&(t, name))),
-                Some(GState::One(b)) if m.bindings.get(*b as usize).map(|x| x.origin) == Some(Origin::Import(i))
-            )
+        // The path's resolution is the first table (in the fixed table
+        // order) where this import has one meaning, whichever table filled
+        // first; once every table is ⊤ it is an error (reported at the end).
+        let first = tables(m, true).into_iter().find_map(|t| {
+            match w
+                .named_res
+                .get(s as usize)
+                .and_then(|r| r.get(&(t, m.fold.key(t, name))))
+            {
+                Some(GState::One(b))
+                    if m.bindings.get(*b as usize).map(|x| x.origin) == Some(Origin::Import(i)) =>
+                {
+                    m.bindings.get(*b as usize).map(|x| (x.res, *b))
+                }
+                _ => None,
+            }
         });
-        if !any_one {
-            if let Some(imp) = m.imports.get_mut(i as usize) {
-                imp.res = Res::Err;
-                imp.segs.clear();
+        if let Some(imp) = m.imports.get_mut(i as usize) {
+            match first {
+                Some((res, b)) => {
+                    // The first table with one meaning changed (a table
+                    // before it filled, or turned ⊤): it takes over the
+                    // path's resolution and its last segment's reference.
+                    if imp.res != res {
+                        imp.res = res;
+                        let source = w.sources.get(&b).copied().unwrap_or(NONE);
+                        let last = imp.segs.iter().map(|x| x.0).max();
+                        if let Some(e) = imp.segs.iter_mut().find(|x| Some(x.0) == last) {
+                            *e = (e.0, res, source);
+                        }
+                    }
+                }
+                None => {
+                    imp.res = Res::Err;
+                    imp.segs.clear();
+                }
             }
         }
-        wake_subs(w, s, name);
+        wake_subs(w, s, folded);
     }
     drain(m, w)
 }
@@ -1347,7 +1555,7 @@ fn install_glob(
     imp.late = final_mode;
     imp.segs = segs;
     let s = imp.scope;
-    let _was = w.stuck.remove(&i);
+    unstick(m, w, i);
     let span = import_span(m, i);
     let hoist = import_hoist(m);
     match container {
@@ -1381,7 +1589,7 @@ fn install_glob(
                     .get(u as usize)
                     .and_then(|unit| unit.hir.variant(v))
                     .is_some_and(|v| v.shape == hir_lang::Shape::Unit);
-                let mut seen = [false; 5];
+                let mut seen = [false; TABLES];
                 for ns in [Namespace::Value, Namespace::Type] {
                     let t = m.policy.table_ix(ns);
                     match seen.get_mut(t as usize) {
@@ -1391,6 +1599,7 @@ fn install_glob(
                     let b = m.push_binding(Binding {
                         ns: t,
                         name: Name::new(sym),
+                        key: m.fold.key(t, Name::new(sym)),
                         res: Res::Def(m.def_id(u, Def::Variant(v))),
                         kind: DefKind::Variant { unit: unit_variant },
                         vis: Vis::Public,
@@ -1415,6 +1624,7 @@ fn install_glob(
                 let b = m.push_binding(Binding {
                     ns: t,
                     name,
+                    key: m.fold.key(t, name),
                     res: e.res,
                     kind: e.kind,
                     vis: e.vis,
@@ -1479,7 +1689,7 @@ fn slot_vis(m: &Model<'_>, w: &Work, src: u32) -> Vis {
     let Some(b) = m.bindings.get(src as usize) else {
         return Vis::Private;
     };
-    let key = (b.ns, b.name);
+    let key = (b.ns, b.key);
     let s = b.home as usize;
     let amb = |g: Option<&GState>| match g {
         Some(GState::Amb { a, vis, .. }) if *a == src => Some(*vis),
@@ -1507,8 +1717,8 @@ fn add_glob(m: &mut Model<'_>, w: &mut Work, task: Task) -> Result<(), ResolveEr
     if !direct && !m.accessible(src_vis, source.home, s) {
         return Ok(());
     }
-    let key = (source.ns, source.name);
-    if def_in(m, w, s, key).is_some() || !named_of(w, s, source.name).is_empty() {
+    let key = (source.ns, source.key);
+    if def_in(m, w, s, key).is_some() || named_of(m, w, s, source.ns, source.key).next().is_some() {
         return Ok(());
     }
     let gvis = m.imports.get(g as usize).map_or(Vis::Private, |i| i.vis);
@@ -1575,8 +1785,9 @@ fn add_glob(m: &mut Model<'_>, w: &mut Work, task: Task) -> Result<(), ResolveEr
     if let Some(r) = w.glob_res.get_mut(s as usize) {
         let _ = r.insert(key, next);
     }
-    wake(w, s, source.name);
-    wake_subs(w, s, source.name);
+    let folded = m.fold.name(source.name);
+    wake(w, s, folded);
+    wake_subs(w, s, folded);
     announce(w, s, next);
     Ok(())
 }
@@ -1598,8 +1809,8 @@ fn report_top(m: &mut Model<'_>, w: &Work) {
             .get(imp.scope as usize)
             .into_iter()
             .flat_map(|r| r.iter())
-            .find_map(|((_, n), g)| match g {
-                GState::Amb { a, b, .. } if *n == name => Some((*a, *b)),
+            .find_map(|((t, n), g)| match g {
+                GState::Amb { a, b, .. } if *n == m.fold.key(*t, name) => Some((*a, *b)),
                 _ => None,
             });
         let res = |x: u32| m.bindings.get(x as usize).map_or(Res::Err, |b| b.res);
@@ -1632,7 +1843,7 @@ fn recheck_late(m: &mut Model<'_>, w: &Work) {
         .map(|(i, _)| ix(i))
         .collect();
     for i in late {
-        let now = match attempt(m, w, i, true) {
+        let now = match attempt(m, w, i, Finality::Cycle) {
             Attempt::Named { slots, .. } => slots.iter().find_map(|(_, s)| match s {
                 Slot::Hit(h) => Some(h.res),
                 Slot::Top(..) => None,
@@ -1677,7 +1888,8 @@ fn build_tables(m: &mut Model<'_>, w: &Work) {
                 if let Some(binding) = m.bindings.get(b as usize).filter(|b| !b.shadowed) {
                     table.push(Entry {
                         ns: binding.ns,
-                        name: binding.name,
+                        name: binding.key,
+                        spelling: binding.name,
                         state: EntryState::One(b),
                     });
                 }
@@ -1690,7 +1902,8 @@ fn build_tables(m: &mut Model<'_>, w: &Work) {
                     if let Some(name) = imp.name {
                         table.push(Entry {
                             ns: ANY_NS,
-                            name,
+                            name: m.fold.name(name),
+                            spelling: name,
                             state: EntryState::Failed(i),
                         });
                     }
@@ -1702,9 +1915,12 @@ fn build_tables(m: &mut Model<'_>, w: &Work) {
             .flatten()
         {
             for (&(ns, name), &g) in map {
+                let (GState::One(b) | GState::Amb { a: b, .. }) = g;
+                let spelling = m.bindings.get(b as usize).map_or(name, |b| b.name);
                 table.push(Entry {
                     ns,
                     name,
+                    spelling,
                     state: entry_state(g),
                 });
             }

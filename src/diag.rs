@@ -154,6 +154,15 @@ pub enum DiagKind {
     },
     /// A mixin that uses itself, directly or through other mixins.
     MixinCycle,
+    /// A class whose bases admit no C3 method resolution order (Python's
+    /// `TypeError` at class creation): a base listed before a class that
+    /// derives from it, a repeated base, or orders that contradict each
+    /// other. Member lookup falls back to the bases' orders concatenated left
+    /// to right without repeats.
+    InconsistentMro {
+        /// The class.
+        class: Name,
+    },
     /// The HIR refused a resolution resolve-lang computed. This indicates a
     /// disagreement between this crate and hir-lang's checks; the path is
     /// left as `Res::Err` so the `Hir` stays valid.
@@ -357,6 +366,11 @@ impl Diagnostic {
                 n(Name::new(name))
             ),
             DiagKind::MixinCycle => write!(out, "this mixin uses itself"),
+            DiagKind::InconsistentMro { class } => write!(
+                out,
+                "cannot create a consistent method resolution order (MRO) for the bases of `{}`",
+                n(class)
+            ),
             DiagKind::Rejected { error } => {
                 write!(out, "the HIR refused this resolution: {error}")
             }
@@ -488,6 +502,7 @@ mod tests {
             },
             DiagKind::UnknownMixinMember { name: x.sym },
             DiagKind::MixinCycle,
+            DiagKind::InconsistentMro { class: x },
             DiagKind::Rejected {
                 error: HirError::RootNotModule,
             },

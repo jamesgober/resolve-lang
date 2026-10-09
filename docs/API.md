@@ -1,7 +1,7 @@
 # resolve-lang &mdash; API Reference
 
 > Complete reference for every public item in `resolve-lang`, with examples.
-> **Status: 0.2.0, pre-1.0.** The surface is designed across the 0.x series and
+> **Status: 0.3.0, pre-1.0.** The surface is designed across the 0.x series and
 > frozen at `1.0.0`, after the LexerSketch LSP drives go-to-definition and
 > rename through it (see [`../dev/ROADMAP.md`](../dev/ROADMAP.md)).
 
@@ -19,13 +19,14 @@
   - [Imports as a fixpoint](#imports-as-a-fixpoint)
   - [Bare identifier patterns](#bare-identifier-patterns)
   - [Classes, members, and mixins](#classes-members-and-mixins)
+  - [Case folding](#case-folding)
   - [What every path ends as](#what-every-path-ends-as)
 - [`resolve`](#resolve)
 - [`Policy`](#policy)
   - [`Policy::new`](#policynew), [`Policy::kraken`](#policykraken), [`Policy::php`](#policyphp), [`Policy::python`](#policypython)
   - [Setters](#policy-setters)
   - [Getters](#policy-getters)
-- [`Namespace`](#namespace) and [`NsSet`](#nsset)
+- [`Namespace`](#namespace), [`NsSet`](#nsset), and [`Case`](#case)
 - [`ItemClass`](#itemclass)
 - [`Hoist`](#hoist), [`Shadowing`](#shadowing), [`Redefinition`](#redefinition), [`ClassScope`](#classscope), [`ModuleScope`](#modulescope), [`RootBinding`](#rootbinding), [`Reexport`](#reexport)
 - [`Env`](#env), [`Export`](#export), [`DefKind`](#defkind), [`NoEnv`](#noenv), [`MapEnv`](#mapenv)
@@ -55,7 +56,7 @@ definitions and references.
 
 ```toml
 [dependencies]
-resolve-lang = "0.2"
+resolve-lang = "0.3"
 hir-lang = "0.3"
 intern-lang = "1"
 ```
@@ -97,9 +98,11 @@ assert_eq!(hir.path(p).res, Res::Local(binder));
    [Imports as a fixpoint](#imports-as-a-fixpoint)); each scope gets its final
    table.
 3. **Walk.** One walk per unit resolves every path. Paths that need class member
-   tables are planned partially.
+   tables are planned partially; an unqualified name inside a class whose
+   inherited members it might name is resolved and set aside.
 4. **Members.** Class member tables are built, mixins expanded in dependency
-   order, and the deferred paths finished.
+   order, every class with several bases linearized (C3), and the deferred
+   paths finished.
 5. **Apply and index.** Each planned resolution is written with
    `Hir::resolve_partial`; the index is built.
 
@@ -120,14 +123,32 @@ After the lexical scopes: the program's unit roots and the environment's roots
 
 | Path namespace | Tables searched for the last segment | For a prefix segment |
 |---|---|---|
-| `Value` | value | module, type |
+| `Value`, the callee of a call | value, then constant | module, type |
+| `Value`, anywhere else | constant, then value | module, type |
 | `Type` | type | module, type |
-| `Pattern` | value (then filtered: constants, unit variants, unit records) | module, type |
-| `Import` | value, type, module, macro (one binding per table found) | module, type |
+| `Pattern` | constant, then value (then filtered: constants, unit variants, unit records) | module, type |
+| `Import` | value, type, module, macro, constant (one binding per table found) | module, type |
 | `Region` | binders only | &mdash; |
 
-Tables are after [merging](#namespace): with `Policy::python()`, all of them are
-one table.
+Tables are after [merging](#namespace): by default constants share the value
+table (so the two orders are one lookup); with `Policy::python()`, all of them
+are one table. Under `Policy::php()` the constant table is separate, so
+`config()` finds function `config` and `config` finds constant `config` when
+both exist. When only one exists, both forms find it (a bare function name is a
+function reference; calling a constant is left to run time), which is more
+lenient than PHP, where `strlen` as a bare name is an undefined constant.
+
+Inside a class whose members are lexically visible
+([`ClassScope::Lexical`](#classscope)), the class's inherited members come
+between its own members and the enclosing scopes: a base's member shadows a
+module item of the same name, and a local or the class's own member shadows the
+base's. Inherited members are only known once every base is resolved, so such a
+name is resolved as if nothing were inherited, set aside, and finished in phase
+4: the first member in [method resolution order](#classes-members-and-mixins)
+that the class may use (a base's `private` member is not inherited, so the
+search goes on past it) wins; with none, the set-aside outcome stands. The
+class header (its bases, interfaces, and mixin uses) never sees inherited
+members: it names them.
 
 ### Paths and partial resolution
 
@@ -169,17 +190,38 @@ compromises:
 
 - A **lexical first segment** that misses in a scope with globs may later be
   provided by a glob, which would shadow an outer scope, a root, or the prelude.
-  Such imports wait; when nothing else can move, the lowest-numbered one is
-  settled in *final mode* (misses count as absent) and the worklist resumes.
-  Imports settled that way are checked again at the end and reported as
-  [`ImportAmbiguity`](#diagkind) if the finished tables would resolve them
-  differently.
+  Such imports wait. When nothing else can move, each wait is *glob-blocked*
+  (only a glob could still fill the slot) or *import-blocked* (a waiting named
+  import binds the name). A name is *producible* while a waiting named import
+  of that name, or any waiting glob, could still create a slot for it; new
+  slots come from nowhere else. The worklist then settles, in this order:
+  1. the lowest-numbered glob-blocked import waiting on an unproducible name,
+     in *exact final mode*: a miss in a scope with globs counts as absent only
+     for an unproducible name (a producible one is still waited for), so its
+     fallback is the one the finished tables give;
+  2. otherwise the lowest-numbered glob-blocked import, in *forced final mode*
+     (every such miss counts as absent);
+  3. only when every wait is import-blocked (a true cycle), the
+     lowest-numbered one, in *cycle mode*, where a name a waiting import binds
+     is an [`ImportCycle`](#diagkind).
+
+  In the two final modes a name a waiting named import binds is still waited
+  for. Imports settled in a final mode are checked again at the end and
+  reported as [`ImportAmbiguity`](#diagkind) if the finished tables would
+  resolve them differently. A differential test (`tests/import_corner.rs`)
+  holds this to a naive fixpoint on random graphs of relative imports whose
+  first segment arrives only through globs, under isolated and lexical module
+  scoping.
 - A **glob import** whose module path turns ambiguous after it has copied names
   keeps what it copied (retracting would break monotonicity) and is reported as
   [`ImportAmbiguity`](#diagkind).
 
 A named import never resolves through itself (`import os` looks past its own
-binding of `os`). Names that remain absent are [`Unresolved`](#diagkind);
+binding of `os`), and a named import shadows what a glob would bring under its
+name. An import that binds several tables (a name that is both a function and a
+module, say) resolves its path to the first table in the order value, type,
+module, macro, constant that holds one meaning, whichever filled first. Names
+that remain absent are [`Unresolved`](#diagkind);
 imports waiting on each other are [`ImportCycle`](#diagkind); a name bound by a
 failed import is [`BrokenImport`](#diagkind) where it is used.
 
@@ -201,10 +243,45 @@ defines it; two mixins contributing different members of one name without an
 adds an alias, `m as protected` changes visibility. Mixins that use mixins are
 expanded first; a cycle is [`MixinCycle`](#diagkind).
 
-Inherited lookups walk `bases` (`supers` for interfaces): own members first, then
-the bases depth-first, left to right. Private members are accessible inside the
-class that holds them; protected members inside any class related by
-inheritance. Unqualified access to members follows [`ClassScope`](#classscope).
+Inherited lookups follow the **C3 method resolution order** (Python's): a class
+`C` with bases `B1 … Bn` (`supers` for interfaces) has the order `C` followed by
+the merge of `L(B1) … L(Bn)` and the list `B1 … Bn`, taking at each step the
+first head that is in no list's tail. One base `B` gives `C, L(B)`, so long
+single-inheritance chains are walked directly and memoized. Classes with
+several bases are linearized once, eagerly, bases first, without recursion. When
+no head qualifies the hierarchy is inconsistent (a base listed before a class
+derived from it, a repeated base, contradictory orders): that is
+[`InconsistentMro`](#diagkind), as Python raises `TypeError` at class creation,
+and the class falls back to its bases' orders concatenated left to right
+without repeats, so member lookup still answers. A base outside the program is a
+leaf (the environment answers for its ancestors); a base still being linearized
+(an inheritance cycle) is a leaf too, so every class gets an order.
+
+Private members are accessible inside the class that holds them; protected
+members inside any class related by inheritance. Unqualified access to members
+follows [`ClassScope`](#classscope).
+
+### Case folding
+
+A [`Case`](#case) is set per table. A case-insensitive table compares names
+after mapping ASCII `A`-`Z` to `a`-`z`; every other byte must match. Every
+lookup goes through the table's key, so the rule holds for unqualified names,
+module-qualified paths, imports, class members, mixin rules (`HELLO as greet`
+names method `Hello`), unit root names, and duplicate detection (`function foo`
+and `function FOO` in one scope are a [`Duplicate`](#diagkind)). Names are kept
+as written everywhere a tool sees them: diagnostics, [`ClassMember`](#classmember)
+names, the [`Index`](#index). A [`rename_set`](#index) includes references
+spelled in another case (`GREET()` for `function Greet`), except ones through an
+aliased import, which spell the alias.
+
+The fold maps each symbol to the canonical symbol of its case class (the
+lowercase spelling if the interner has it, else the lowest-numbered spelling),
+which is fixed by the interner, so results do not depend on visiting order.
+With any case-insensitive table, resolution first passes once over the
+interner's symbols (allocating only for those with an ASCII capital); without
+one, folding is free. Names the [`Env`](#env) is asked for are passed as
+written: an environment serving a case-insensitive table matches them
+case-insensitively itself.
 
 ### What every path ends as
 
@@ -273,11 +350,12 @@ The lexical default, equal to [`kraken`](#policykraken):
 | Setting | Value |
 |---|---|
 | Hoisting | every item class: [`Hoist::Scope`](#hoist) |
-| Namespaces | value, type, macro, label tables; modules share the type table |
-| Occupies | functions, constants, globals: value; records, classes: type and value; sums, interfaces, aliases, associated types: type; modules: module |
+| Namespaces | value, type, macro, label tables; modules share the type table, constants the value table |
+| Case | every table case-sensitive |
+| Occupies | functions, globals: value; constants: constant; records, classes: type and value; sums, interfaces, aliases, associated types: type; modules: module |
 | Shadowing | [`Allow`](#shadowing) |
 | Redefinition | [`Error`](#redefinition) |
-| Class scope | [`Lexical`](#classscope) |
+| Class scope | [`Lexical`](#classscope) (own and inherited members) |
 | Module scope | [`Isolated`](#modulescope) |
 | Roots | `self::` early; `parent::`, `static::` unsupported |
 | Visibility | enforced; private items visible in descendant modules |
@@ -319,16 +397,35 @@ conditional declarations included); class members only through
 `self::`/`parent::`/`static::` ([`ClassScope::Qualified`](#classscope));
 `self::` and `parent::` early, `static::` late; nested namespaces see outer
 names; no glob imports; imports never re-export; `global $x` may name a global
-that does not exist yet (it binds `Res::Extern`).
+that does not exist yet (it binds `Res::Extern`). Names follow PHP 8's tables
+and case rules:
+
+| Table | Holds | Case |
+|---|---|---|
+| value | functions, methods | ASCII-insensitive |
+| type (with module) | classes, interfaces, traits, enums, namespaces | ASCII-insensitive |
+| constant | constants, class constants, globals, static properties | sensitive |
+
+So a function and a constant, or a method and a class constant, may share a
+name (not a [`Duplicate`](#diagkind)); `strlen()` and `STRLEN()` are one
+function; `FOO` and `foo` are two constants; and a class is a type only
+(construct it through a type path, as `new C` lowers). HIR paths carry no `$`
+sigil, so a sketch that strips it from static property names makes a static
+property and a class constant of one name collide: keep the sigil in property
+names (`$count`).
 
 ```rust
-use resolve_lang::{ClassScope, Hoist, ItemClass, Policy, RootBinding};
+use resolve_lang::{Case, ClassScope, Hoist, ItemClass, Namespace, NsSet, Policy, RootBinding};
 
 let p = Policy::php();
 assert_eq!(p.hoisting(ItemClass::Fn), Hoist::Module);
 assert_eq!(p.class_scope(), ClassScope::Qualified);
 assert_eq!(p.static_root(), RootBinding::Late);
 assert!(!p.globs_allowed());
+assert_eq!(p.case(Namespace::Value), Case::AsciiInsensitive);
+assert_eq!(p.case(Namespace::Const), Case::Sensitive);
+assert_eq!(p.occupies(ItemClass::Class), NsSet::single(Namespace::Type));
+assert_ne!(p.table(Namespace::Const), p.table(Namespace::Value));
 ```
 
 ### `Policy::python`
@@ -337,11 +434,13 @@ assert!(!p.globs_allowed());
 pub const fn python() -> Policy
 ```
 
-Python and Mercury: one table for every name; scope hoisting (a name bound
-anywhere in a scope belongs to the whole scope); class bodies visible to their
-own initializers but not to methods ([`ClassScope::BodyOnly`](#classscope));
-redefinition rebinds ([`LastWins`](#redefinition)); visibility not enforced;
-imports always re-export; no type-relative roots; implicit globals.
+Python and Mercury: one case-sensitive table for every name; scope hoisting (a
+name bound anywhere in a scope belongs to the whole scope); class bodies visible
+to their own initializers but not to methods
+([`ClassScope::BodyOnly`](#classscope)); members inherited in C3 order, an
+inconsistent hierarchy reported ([`InconsistentMro`](#diagkind)); redefinition
+rebinds ([`LastWins`](#redefinition)); visibility not enforced; imports always
+re-export; no type-relative roots; implicit globals.
 
 ```rust
 use resolve_lang::{ClassScope, Namespace, Policy, Redefinition};
@@ -360,7 +459,8 @@ Each takes the policy by value and returns the changed policy.
 |---|---|---|
 | `with_hoisting(class, hoist)` | [`ItemClass`](#itemclass), [`Hoist`](#hoist) | When items of `class` become visible. `Hoist::Module` never moves class members out of their class. |
 | `with_occupies(class, set)` | [`ItemClass`](#itemclass), [`NsSet`](#nsset) | The namespaces items of `class` define their name in. Imports ignore it (they bind what their target defines). |
-| `with_merge(from, into)` | two [`Namespace`](#namespace)s | `from` (and everything already merged with it) shares `into`'s table. |
+| `with_merge(from, into)` | two [`Namespace`](#namespace)s | `from` (and everything already merged with it) shares `into`'s table, which keeps `into`'s case. |
+| `with_case(ns, case)` | [`Namespace`](#namespace), [`Case`](#case) | How the table of `ns` (and everything merged with it) compares names. Merge first, then set the case. |
 | `with_shadowing(rule)` | [`Shadowing`](#shadowing) | Whether binders may reuse visible names. |
 | `with_redefinition(rule)` | [`Redefinition`](#redefinition) | What two definitions of a name in one scope mean. |
 | `with_class_scope(rule)` | [`ClassScope`](#classscope) | What code in a class sees of its members unqualified. |
@@ -380,6 +480,7 @@ let p = Policy::new()
     .with_hoisting(ItemClass::Fn, Hoist::AfterDecl)
     .with_occupies(ItemClass::Record, NsSet::single(Namespace::Type))
     .with_merge(Namespace::Macro, Namespace::Value)
+    .with_case(Namespace::Type, resolve_lang::Case::AsciiInsensitive)
     .with_shadowing(Shadowing::DenySameScope)
     .with_redefinition(Redefinition::LastWins)
     .with_class_scope(ClassScope::Qualified)
@@ -390,6 +491,7 @@ let p = Policy::new()
     .with_implicit_globals(true);
 assert_eq!(p.hoisting(ItemClass::Fn), Hoist::AfterDecl);
 assert_eq!(p.table(Namespace::Macro), Namespace::Value);
+assert_eq!(p.case(Namespace::Module), resolve_lang::Case::AsciiInsensitive);
 assert!(!p.aliases_allowed());
 ```
 
@@ -400,6 +502,7 @@ assert!(!p.aliases_allowed());
 | `hoisting(class)` | [`Hoist`](#hoist) |
 | `occupies(class)` | [`NsSet`](#nsset) (before merging) |
 | `table(ns)` | the [`Namespace`](#namespace) whose table `ns` is stored in |
+| `case(ns)` | the [`Case`](#case) of that table |
 | `shadowing()`, `redefinition()`, `class_scope()`, `module_scope()` | the rule |
 | `self_root()`, `parent_root()`, `static_root()` | [`RootBinding`](#rootbinding) |
 | `visibility_enforced()`, `private_to_descendants()` | `bool` |
@@ -424,20 +527,27 @@ assert!(!p.implicit_globals());
 
 ```rust,ignore
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Namespace { Value, Type, Module, Macro, Label }
+pub enum Namespace { Value, Type, Module, Macro, Label, Const }
 impl Namespace {
-    pub const ALL: [Namespace; 5];
+    pub const ALL: [Namespace; 6];
     pub const fn name(self) -> &'static str;
 }
 ```
 
 The tables names live in. HIR has no macro items or label paths: those
 namespaces exist for merging rules and for names the environment exports.
+`Const` holds constants (and, under [`Policy::php`](#policyphp), globals and
+static properties); it is merged into `Value` unless the policy keeps it apart,
+and value paths search it before or after the value table depending on whether
+they are a call's callee (see [Lexical lookup](#lexical-lookup)).
 
 ```rust
 use resolve_lang::Namespace;
 
-assert_eq!(Namespace::ALL.map(Namespace::name), ["value", "type", "module", "macro", "label"]);
+assert_eq!(
+    Namespace::ALL.map(Namespace::name),
+    ["value", "type", "module", "macro", "label", "constant"]
+);
 ```
 
 ## `NsSet`
@@ -466,6 +576,28 @@ assert_eq!(s, NsSet::of(&[Namespace::Value, Namespace::Type]));
 assert!(s.contains(Namespace::Type) && !s.is_empty());
 assert_eq!(s.iter().collect::<Vec<_>>(), [Namespace::Value, Namespace::Type]);
 assert!(NsSet::single(Namespace::Module).contains(Namespace::Module));
+```
+
+## `Case`
+
+```rust,ignore
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Case { Sensitive, AsciiInsensitive }
+```
+
+How a table compares names (see [Case folding](#case-folding)).
+`AsciiInsensitive` is PHP 8's rule: ASCII letters fold, every other byte
+(UTF-8 included) must match. Unicode case folding is not offered: no target
+language needs it, and its tables change with the Unicode version, which would
+make resolution depend on the toolchain.
+
+```rust
+use resolve_lang::{Case, Namespace, Policy};
+
+let p = Policy::new().with_case(Namespace::Value, Case::AsciiInsensitive);
+assert_eq!(p.case(Namespace::Value), Case::AsciiInsensitive);
+assert_eq!(p.case(Namespace::Type), Case::Sensitive);
 ```
 
 ## `ItemClass`
@@ -550,7 +682,7 @@ pub enum ClassScope { Lexical, BodyOnly, Qualified }
 
 | Variant | Class members unqualified |
 |---|---|
-| `Lexical` | everywhere in the class, methods included (the class's own members) |
+| `Lexical` | everywhere in the class body, methods included: its own members, then inherited ones in C3 order (not a base's private members), then the enclosing scopes |
 | `BodyOnly` | in the class body and its constant/global initializers, not in methods, lambdas, or nested classes (Python) |
 | `Qualified` | never (PHP: `self::x`, `$this->x`) |
 
@@ -937,7 +1069,7 @@ assert!(hir.validate().is_ok());
 ```rust,ignore
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClassMember {
-    pub name: Name,             // the name in this class (an alias's new name)
+    pub name: Name,             // the name in this class as written (an alias's new name)
     pub namespace: Namespace,   // its table, after merging
     pub res: Res,               // what it resolves to (a mixin member: the mixin's item)
     pub vis: Vis,               // its visibility here (a rule may change it)
@@ -1008,6 +1140,7 @@ impl DiagKind {
 | `NotAMixin { found }` | A mixin use names something that is not a mixin. | |
 | `UnknownMixinMember { name }` | A mixin rule names a member no used mixin has. | |
 | `MixinCycle` | A mixin uses itself. | |
+| `InconsistentMro { class }` | A class whose bases admit no C3 order (Python's `TypeError` at class creation); lookups fall back to the bases' orders concatenated without repeats. | ``cannot create a consistent method resolution order (MRO) for the bases of `C` `` |
 | `Rejected { error }` | hir-lang refused a resolution resolve-lang computed (a disagreement between the crates; the path is left `Res::Err`). | |
 
 ```rust
@@ -1135,7 +1268,8 @@ The persistent definition/reference index of the whole program.
   `resolve_at` (by HIR id), `path_references`, and `def_of` are `O(1)` or
   `O(log n)`; `at` is a binary search over the unit's name spans.
 - **Rename:** `rename_set(def)` is the definition's name plus every reference
-  spelling the same name; references through an aliased import spell the alias
+  spelling the same name (up to the case folding of a case-insensitive table:
+  `GREET()` for `function Greet` is renamed too); references through an aliased import spell the alias
   and are left alone. Renaming the alias edits the alias and the references that
   went through it. Names produced by expansions are listed apart
   (`outside_source`).
@@ -1307,14 +1441,22 @@ assert_eq!(SymbolKind::External.name(), "external");
   factors (sorted tables, `lookup_local`). Lexical lookup is `O(log k)` for the
   name's key plus `O(1)` stack work.
 - Glob propagation is bounded by the slots it fills (each changes a bounded
-  number of times), capped by the glob budget. Inheritance lookups are memoized
-  along single-base chains and capped by the member budget. Each did-you-mean
-  considers at most 4,096 candidates and is charged to the suggestion budget.
+  number of times), capped by the glob budget, which also pays for choosing
+  which stuck import to settle. Inheritance lookups are memoized along
+  single-base chains and capped by the member budget, as is C3 linearization:
+  each class with several bases costs about the total length of its bases'
+  orders times their number (a "ladder" of classes each adding a base has
+  orders growing linearly, so its total cost grows quadratically, as in
+  Python; the budget stops it). Each did-you-mean considers at most 4,096
+  candidates and is charged to the suggestion budget.
+- With a case-insensitive table, one pass over the interner's symbols builds
+  the fold (linear in the interned bytes; allocation only for symbols with an
+  ASCII capital).
 - Every arena index is a `u32`, as in hir-lang.
 
 ## What is not done yet
 
-Stated plainly, for 0.2.0:
+Stated plainly, for 0.3.0:
 
 - **Incremental update hooks** (re-resolving one changed unit, or one changed
   item, without the rest) are v0.5.0 work.
@@ -1328,12 +1470,13 @@ Stated plainly, for 0.2.0:
   message renderer; a `diag_lang::Diagnostic` conversion is additive later.
 - A glob import whose module path turns ambiguous after copying names keeps them
   (see [Imports as a fixpoint](#imports-as-a-fixpoint)).
-- Unqualified class members (`ClassScope::Lexical`) see the class's own members,
-  not inherited or mixin-provided ones; those are reached with `self::` or
-  type-directed resolution.
-- Multiple inheritance is searched depth-first, left to right, not by C3
-  linearization.
-- PHP specifics a lowering must handle: case-insensitive function and class
-  names, and PHP's separate tables for constants and methods inside one class
-  (the PHP preset reports a method and a constant of one name in one class as a
-  duplicate).
+- **PHP approximations that remain.** A value path that is not a callee finds a
+  function when no constant of that name exists (PHP reports an undefined
+  constant), and a callee finds a constant when no function exists (PHP fails
+  at run time); both are documented leniencies, not checks. HIR paths carry no
+  `$` sigil, so static properties must keep it in their names to stay apart
+  from class constants. Only ASCII case folding exists (PHP 8 needs no more).
+- An [`Env`](#env) is asked with names as written; a host serving a
+  case-insensitive table folds them itself.
+- Interface default methods do not see inherited members unqualified
+  (`ClassScope` applies to classes; interface bodies are never lexical).

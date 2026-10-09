@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b583a4f6d5190eef6e73fc2e5f97231003d3c41da8d0b4fb84e7eae50bd176da # shrinks to p = Prog { top: [], members: [], uses: [], self_uses: [], class_uses: [(0, Use { callee: false, base: 0, mask: 0 })] }

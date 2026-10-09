@@ -14,7 +14,8 @@ use hir_lang::{ItemKind, Vis};
 /// HIR paths carry a syntactic namespace ([`hir_lang::Ns`]); these are the
 /// *tables* names are stored in. A language merges tables with
 /// [`Policy::with_merge`] (Python keeps everything in one table; Rust keeps types
-/// and modules in one).
+/// and modules in one; by default constants share the value table, PHP keeps
+/// them apart).
 ///
 /// # Examples
 ///
@@ -22,7 +23,7 @@ use hir_lang::{ItemKind, Vis};
 /// use resolve_lang::Namespace;
 ///
 /// assert_eq!(Namespace::Value.name(), "value");
-/// assert_eq!(Namespace::ALL.len(), 5);
+/// assert_eq!(Namespace::ALL.len(), 6);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Namespace {
@@ -38,6 +39,14 @@ pub enum Namespace {
     /// Loop and block labels. Labels are binders resolved by lowering, so no
     /// HIR path is looked up here; the namespace exists for merging rules.
     Label,
+    /// Constants (and, under [`Policy::php`], globals and static properties):
+    /// the names a language keeps apart from its functions. Merged into
+    /// [`Value`](Self::Value) unless the policy separates it, as PHP does: a
+    /// PHP function and a constant (or a method and a class constant) may
+    /// share a name. A value path that is the callee of a call searches the
+    /// value table first and this one second; any other value path searches
+    /// this one first.
+    Const,
 }
 
 impl Namespace {
@@ -50,12 +59,13 @@ impl Namespace {
     ///
     /// assert_eq!(Namespace::ALL[0], Namespace::Value);
     /// ```
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Value,
         Self::Type,
         Self::Module,
         Self::Macro,
         Self::Label,
+        Self::Const,
     ];
 
     /// The lowercase name, for messages.
@@ -75,6 +85,7 @@ impl Namespace {
             Self::Module => "module",
             Self::Macro => "macro",
             Self::Label => "label",
+            Self::Const => "constant",
         }
     }
 
@@ -89,7 +100,8 @@ impl Namespace {
             1 => Self::Type,
             2 => Self::Module,
             3 => Self::Macro,
-            _ => Self::Label,
+            4 => Self::Label,
+            _ => Self::Const,
         }
     }
 }
@@ -465,6 +477,39 @@ pub enum Reexport {
     Never,
 }
 
+/// How a namespace's table compares names.
+///
+/// Folding is a property of the *table*: every name stored in it, and every
+/// name looked up in it, is compared through the same fold. Folding is
+/// deterministic and independent of locale; diagnostics, the index, and
+/// [`ClassMember`](crate::ClassMember) keep each name as it was written.
+///
+/// Only ASCII folding is offered: it is what PHP 8 does for function,
+/// class, interface, trait, enum, and namespace names (bytes `A`-`Z` match
+/// `a`-`z`; every other byte, including UTF-8 sequences, must match
+/// exactly). Unicode case folding is not provided: no target language needs
+/// it, and its tables change with the Unicode version, which would make
+/// resolution depend on the toolchain.
+///
+/// # Examples
+///
+/// ```
+/// use resolve_lang::{Case, Namespace, Policy};
+///
+/// assert_eq!(Policy::php().case(Namespace::Value), Case::AsciiInsensitive);
+/// assert_eq!(Policy::php().case(Namespace::Const), Case::Sensitive);
+/// assert_eq!(Policy::python().case(Namespace::Value), Case::Sensitive);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Case {
+    /// Names match only when spelled identically (the default everywhere).
+    Sensitive,
+    /// Names match when they are equal after mapping ASCII `A`-`Z` to
+    /// `a`-`z` (PHP 8).
+    AsciiInsensitive,
+}
+
 /// A language's complete scoping policy.
 ///
 /// Start from a preset ([`kraken`](Self::kraken), [`php`](Self::php),
@@ -488,7 +533,9 @@ pub enum Reexport {
 pub struct Policy {
     hoist: [Hoist; 11],
     occupies: [NsSet; 11],
-    merge: [Namespace; 5],
+    merge: [Namespace; 6],
+    /// By table index (the namespace a table is merged into).
+    case: [Case; 6],
     shadowing: Shadowing,
     redefinition: Redefinition,
     class_scope: ClassScope,
@@ -511,7 +558,9 @@ impl Default for Policy {
 impl Policy {
     /// The lexical default (equal to [`kraken`](Self::kraken)): every item
     /// hoisted to its scope; separate value, type, and macro tables with
-    /// modules sharing the type table; class members visible in methods;
+    /// modules sharing the type table and constants sharing the value table;
+    /// every table case-sensitive; class members (own and inherited) visible
+    /// in methods;
     /// isolated nested modules; `Self::` early, `parent::`/`static::`
     /// unsupported; visibility enforced with private items visible to child
     /// modules; globs, aliases, and declared re-exports.
@@ -527,7 +576,7 @@ impl Policy {
     /// ```
     #[must_use]
     pub const fn new() -> Self {
-        use Namespace::{Label, Macro, Module, Type, Value};
+        use Namespace::{Const, Label, Macro, Module, Type, Value};
         let value = NsSet::single(Value);
         let ty = NsSet::single(Type);
         let both = NsSet::of(&[Type, Value]);
@@ -542,12 +591,13 @@ impl Policy {
                 ty,
                 ty,
                 ty,
-                value,
+                NsSet::single(Const),
                 value,
                 NsSet::single(Module),
                 NsSet::EMPTY,
             ],
-            merge: [Value, Type, Type, Macro, Label],
+            merge: [Value, Type, Type, Macro, Label, Value],
+            case: [Case::Sensitive; 6],
             shadowing: Shadowing::Allow,
             redefinition: Redefinition::Error,
             class_scope: ClassScope::Lexical,
@@ -587,13 +637,32 @@ impl Policy {
     /// binding for `static::`); `use` imports are file-local and have no
     /// globs; `global $x` may name a global that does not exist yet.
     ///
+    /// Names follow PHP 8's tables and case rules:
+    ///
+    /// | Table | Holds | Case |
+    /// |---|---|---|
+    /// | [`Value`](Namespace::Value) | functions, methods | ASCII-insensitive |
+    /// | [`Type`](Namespace::Type) (with [`Module`](Namespace::Module)) | classes, interfaces, traits, enums, namespaces | ASCII-insensitive |
+    /// | [`Const`](Namespace::Const) | constants, class constants, globals, static properties | sensitive |
+    ///
+    /// So a function and a constant, or a method and a class constant, may
+    /// share a name; `strlen` and `STRLEN` are one function; and a class is
+    /// a type only (construct it through a type path, as `new C` lowers).
+    /// HIR paths carry no `$` sigil, so a sketch that strips it from static
+    /// property names makes a static property and a class constant of the
+    /// same name collide; keep the sigil in property names (`$count`) to
+    /// keep them apart.
+    ///
     /// # Examples
     ///
     /// ```
-    /// use resolve_lang::{Hoist, ItemClass, Policy};
+    /// use resolve_lang::{Case, Hoist, ItemClass, Namespace, NsSet, Policy};
     ///
     /// let p = Policy::php();
     /// assert_eq!(p.hoisting(ItemClass::Class), Hoist::Module);
+    /// assert_eq!(p.occupies(ItemClass::Class), NsSet::single(Namespace::Type));
+    /// assert_ne!(p.table(Namespace::Const), p.table(Namespace::Value));
+    /// assert_eq!(p.case(Namespace::Type), Case::AsciiInsensitive);
     /// assert!(!p.globs_allowed());
     /// assert!(p.implicit_globals());
     /// ```
@@ -614,8 +683,25 @@ impl Policy {
             ) {
                 p.hoist[i] = Hoist::Module;
             }
+            if matches!(
+                c,
+                ItemClass::Record | ItemClass::Sum | ItemClass::Class | ItemClass::Interface
+            ) {
+                p.occupies[i] = NsSet::single(Namespace::Type);
+            }
             i += 1;
         }
+        p.occupies[ItemClass::Global.index()] = NsSet::single(Namespace::Const);
+        p.merge = [
+            Namespace::Value,
+            Namespace::Type,
+            Namespace::Type,
+            Namespace::Macro,
+            Namespace::Label,
+            Namespace::Const,
+        ];
+        p.case[Namespace::Value.index()] = Case::AsciiInsensitive;
+        p.case[Namespace::Type.index()] = Case::AsciiInsensitive;
         p.class_scope = ClassScope::Qualified;
         p.module_scope = ModuleScope::Lexical;
         p.roots = [RootBinding::Early, RootBinding::Early, RootBinding::Late];
@@ -625,10 +711,13 @@ impl Policy {
         p
     }
 
-    /// Python (and Mercury): one table for every kind of name; a name bound
-    /// anywhere in a scope belongs to the whole scope; class bodies are not
-    /// visible to methods; redefinition rebinds; visibility is convention
-    /// only; imports become module attributes.
+    /// Python (and Mercury): one case-sensitive table for every kind of
+    /// name; a name bound anywhere in a scope belongs to the whole scope;
+    /// class bodies are not visible to methods; members are inherited in C3
+    /// method resolution order (as under every policy; an inconsistent
+    /// hierarchy is reported, as Python raises `TypeError` at class
+    /// creation); redefinition rebinds; visibility is convention only;
+    /// imports become module attributes.
     ///
     /// # Examples
     ///
@@ -649,6 +738,7 @@ impl Policy {
             Namespace::Value,
             Namespace::Value,
             Namespace::Label,
+            Namespace::Value,
         ];
         p.redefinition = Redefinition::LastWins;
         p.class_scope = ClassScope::BodyOnly;
@@ -698,7 +788,8 @@ impl Policy {
 
     /// Merges namespace `from` into the table of `into`: afterwards both (and
     /// everything already merged with either) share one table, so a name
-    /// defined in one conflicts with and is found by the other.
+    /// defined in one conflicts with and is found by the other. The merged
+    /// table keeps `into`'s [`Case`].
     ///
     /// # Examples
     ///
@@ -714,12 +805,32 @@ impl Policy {
         let old = self.merge[from.index()];
         let new = self.merge[into.index()];
         let mut i = 0;
-        while i < 5 {
+        while i < 6 {
             if self.merge[i] as u8 == old as u8 {
                 self.merge[i] = new;
             }
             i += 1;
         }
+        self
+    }
+
+    /// Sets how the table of `ns` (and every namespace merged with it)
+    /// compares names. Merge first, then set the case: a later merge keeps
+    /// the target table's case.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use resolve_lang::{Case, Namespace, Policy};
+    ///
+    /// let p = Policy::new().with_case(Namespace::Type, Case::AsciiInsensitive);
+    /// // Modules share the type table, so they fold too.
+    /// assert_eq!(p.case(Namespace::Module), Case::AsciiInsensitive);
+    /// assert_eq!(p.case(Namespace::Value), Case::Sensitive);
+    /// ```
+    #[must_use]
+    pub const fn with_case(mut self, ns: Namespace, case: Case) -> Self {
+        self.case[self.merge[ns.index()].index()] = case;
         self
     }
 
@@ -904,6 +1015,20 @@ impl Policy {
     #[must_use]
     pub const fn table(&self, ns: Namespace) -> Namespace {
         self.merge[ns.index()]
+    }
+
+    /// How the table of `ns` compares names.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use resolve_lang::{Case, Namespace, Policy};
+    ///
+    /// assert_eq!(Policy::new().case(Namespace::Value), Case::Sensitive);
+    /// ```
+    #[must_use]
+    pub const fn case(&self, ns: Namespace) -> Case {
+        self.case[self.merge[ns.index()].index()]
     }
 
     /// The shadowing rule.
@@ -1098,12 +1223,33 @@ impl Policy {
         }
     }
 
-    /// The table index (`0..5`) of namespace `ns`.
+    /// The table index (`0..TABLES`) of namespace `ns`.
     #[inline]
     pub(crate) const fn table_ix(&self, ns: Namespace) -> u8 {
         self.merge[ns.index()] as u8
     }
+
+    /// Whether table `t` (a table index) folds case.
+    #[inline]
+    pub(crate) const fn table_folds(&self, t: u8) -> bool {
+        (t as usize) < TABLES && !matches!(self.case[t as usize], Case::Sensitive)
+    }
+
+    /// Whether any table folds case.
+    pub(crate) const fn any_folds(&self) -> bool {
+        let mut t = 0u8;
+        while (t as usize) < TABLES {
+            if self.table_folds(t) {
+                return true;
+            }
+            t += 1;
+        }
+        false
+    }
 }
+
+/// The number of name tables (one per [`Namespace`]).
+pub(crate) const TABLES: usize = 6;
 
 /// The rank of a visibility, for "the smaller of two" (glob re-exports).
 pub(crate) const fn vis_rank(v: Vis) -> u8 {

@@ -1,13 +1,15 @@
 //! Criterion benchmarks at realistic scale: whole-unit resolution at about
-//! 100k and 1M HIR nodes, an import-heavy multi-module program, a
-//! multi-unit program, and index queries.
+//! 100k and 1M HIR nodes (also under PHP's case-insensitive tables), an
+//! import-heavy multi-module program, a multi-unit program, class
+//! hierarchies with several bases (C3) and lexically inherited members, and
+//! index queries.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hir_lang::{
-    Binder, BinderKind, Builder, Expr, ExprId, FnDef, Hir, IdKind, Item, ItemId, ItemKind, Name,
-    Ns, Param, Path, PathRoot, Segment, Span, UnitId, Vis,
+    Binder, BinderKind, Builder, ClassDef, Expr, ExprId, FnDef, Hir, IdKind, Item, ItemId,
+    ItemKind, Name, Ns, Param, Path, PathRoot, Segment, Span, Ty, TyId, UnitId, Vis,
 };
 use intern_lang::Interner;
 use resolve_lang::{Policy, Program, Resolver};
@@ -16,8 +18,30 @@ use resolve_lang::{Policy, Program, Resolver};
 /// on each other and on the parameters, and calls of other functions; the
 /// first one calls into `other` (another unit's root name) when given.
 fn lexical_program(unit: u32, fns: usize, other: Option<Name>, names: &mut Interner) -> Hir {
+    spelled_program(unit, fns, other, names, false)
+}
+
+/// As `lexical_program`; with `php`, functions are declared `Fi` and called
+/// as `fi` (found through case folding under `Policy::php()`).
+fn spelled_program(
+    unit: u32,
+    fns: usize,
+    other: Option<Name>,
+    names: &mut Interner,
+    php: bool,
+) -> Hir {
     let mut b = Builder::for_unit(UnitId::new(unit));
     let mut pos = 0u32;
+    let decl_names: Vec<Name> = (0..fns)
+        .map(|i| {
+            let s = if php {
+                format!("F{i}")
+            } else {
+                format!("f{i}")
+            };
+            Name::new(names.intern(&s))
+        })
+        .collect();
     let fn_names: Vec<Name> = (0..fns)
         .map(|i| Name::new(names.intern(&format!("f{i}"))))
         .collect();
@@ -33,7 +57,7 @@ fn lexical_program(unit: u32, fns: usize, other: Option<Name>, names: &mut Inter
         let p = b.path(Path::new(segs, Ns::Value));
         b.expr(Expr::Path(p))
     };
-    for (i, &fname) in fn_names.iter().enumerate() {
+    for (i, &fname) in decl_names.iter().enumerate() {
         let params: Vec<hir_lang::ParamId> = (0..2)
             .map(|j| {
                 let binder = b.binder(Binder::new(locals[j], BinderKind::Param));
@@ -235,6 +259,143 @@ fn bench_program(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_php(c: &mut Criterion) {
+    // The 124k-node unit, declared `Fi` and called `fi`: every call is found
+    // through PHP's case-insensitive function table (the fold of the whole
+    // interner included).
+    let mut group = c.benchmark_group("resolve_php");
+    group.sample_size(10);
+    let mut names = Interner::new();
+    let hir = spelled_program(0, 20_000, None, &mut names, true);
+    let n = nodes(&hir);
+    group.throughput(Throughput::Elements(n));
+    group.bench_function(BenchmarkId::new("case_folded_calls", n), |bench| {
+        bench.iter_batched(
+            || hir.clone(),
+            |h| {
+                let r = Resolver::new(Policy::php()).resolve(h, &names).unwrap();
+                assert!(r.is_clean());
+                r
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+/// `classes` classes, each with three bases drawn from 40 shallow base
+/// classes (Python mixin style, so every C3 order is consistent), a member,
+/// and a method naming inherited members unqualified and through the class.
+fn class_program(classes: usize, names: &mut Interner) -> Hir {
+    let mut b = Builder::new();
+    let mut pos = 0u32;
+    let mut tick = |b: &mut Builder| {
+        pos += 2;
+        b.set_span(Span::new(pos, pos + 1));
+    };
+    let member = |i: usize, names: &mut Interner| Name::new(names.intern(&format!("k{i}")));
+    let mut items = Vec::new();
+    let base_names: Vec<Name> = (0..40)
+        .map(|i| Name::new(names.intern(&format!("B{i}"))))
+        .collect();
+    for (i, &bn) in base_names.iter().enumerate() {
+        let one = b.int(1);
+        let k = b.item(
+            Item::new(
+                Some(member(i, names)),
+                ItemKind::Const {
+                    ty: None,
+                    value: Some(one),
+                },
+            )
+            .with_vis(Vis::Public),
+        );
+        let list = b.list(&[k]);
+        items.push(
+            b.item(
+                Item::new(
+                    Some(bn),
+                    ItemKind::Class(ClassDef {
+                        items: list,
+                        ..ClassDef::default()
+                    }),
+                )
+                .with_vis(Vis::Public),
+            ),
+        );
+    }
+    let ty = |b: &mut Builder, n: Name| -> TyId {
+        let p = b.name_path(n, Ns::Type);
+        b.ty(Ty::Path(p))
+    };
+    for i in 0..classes {
+        let bases: Vec<TyId> = [i % 40, (i * 7 + 3) % 40, (i * 13 + 11) % 40]
+            .iter()
+            .fold(Vec::new(), |mut v, &x| {
+                if !v.contains(&x) {
+                    v.push(x);
+                }
+                v
+            })
+            .into_iter()
+            .map(|x| ty(&mut b, base_names[x]))
+            .collect();
+        let cname = Name::new(names.intern(&format!("C{i}")));
+        let mut uses = Vec::new();
+        for x in [i % 40, (i * 7 + 3) % 40, (i * 13 + 11) % 40] {
+            tick(&mut b);
+            let k = member(x, names);
+            uses.push(b.name_expr(k));
+            let segs = [Segment::new(cname, b.origin()), Segment::new(k, b.origin())];
+            let segs = b.list(&segs);
+            let p = b.path(Path::new(segs, Ns::Value));
+            uses.push(b.expr(Expr::Path(p)));
+        }
+        let list = b.list(&uses);
+        let t = b.expr(Expr::Tuple(list));
+        let body = b.block(&[], Some(t));
+        let m = b.func(Name::new(names.intern("method")), &[], body);
+        let bases = b.list(&bases);
+        let members = b.list(&[m]);
+        items.push(
+            b.item(
+                Item::new(
+                    Some(cname),
+                    ItemKind::Class(ClassDef {
+                        bases,
+                        items: members,
+                        ..ClassDef::default()
+                    }),
+                )
+                .with_vis(Vis::Public),
+            ),
+        );
+    }
+    let root = b.module(None, &items);
+    b.finish(root).unwrap()
+}
+
+fn bench_classes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("resolve_classes");
+    group.sample_size(10);
+    let mut names = Interner::new();
+    let hir = class_program(10_000, &mut names);
+    let n = nodes(&hir);
+    group.throughput(Throughput::Elements(n));
+    group.bench_function(BenchmarkId::new("c3_and_lexical_inheritance", n), |bench| {
+        bench.iter_batched(
+            || hir.clone(),
+            |h| {
+                let r = Resolver::new(Policy::kraken()).resolve(h, &names).unwrap();
+                assert!(r.is_clean());
+                r
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
 fn bench_index(c: &mut Criterion) {
     let mut group = c.benchmark_group("index");
     let mut names = Interner::new();
@@ -270,6 +431,8 @@ criterion_group!(
     bench_lexical,
     bench_imports,
     bench_program,
+    bench_php,
+    bench_classes,
     bench_index
 );
 criterion_main!(benches);

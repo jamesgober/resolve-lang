@@ -106,8 +106,8 @@ pub use index::{
     Target,
 };
 pub use policy::{
-    ClassScope, Hoist, ItemClass, ModuleScope, Namespace, NsSet, Policy, Redefinition, Reexport,
-    RootBinding, Shadowing,
+    Case, ClassScope, Hoist, ItemClass, ModuleScope, Namespace, NsSet, Policy, Redefinition,
+    Reexport, RootBinding, Shadowing,
 };
 pub use program::{ClassMember, Program, Resolution, ResolvedUnit, Resolver};
 

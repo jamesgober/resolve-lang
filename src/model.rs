@@ -1,15 +1,16 @@
 //! The program-wide data every phase shares: units, scope tables, bindings,
 //! imports. All indexes are dense `u32`s into vectors; `NONE` marks absence.
 
-use alloc::vec::Vec;
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::cmp::Ordering;
 
 use hir_lang::{Def, DefId, Hir, ItemId, Name, PathId, Res, Span, Symbol, UnitId, VariantId, Vis};
+use intern_lang::Lookup;
 
 use crate::{
     diag::{DiagKind, Diagnostic},
     env::{DefKind, Env},
-    policy::{Hoist, Policy},
+    policy::{Hoist, Namespace, Policy},
 };
 
 /// "No index".
@@ -24,6 +25,119 @@ pub(crate) const ANY_NS: u8 = u8::MAX;
 #[inline]
 pub(crate) fn ix(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(NONE)
+}
+
+/// Case folding of names, for the tables a policy makes case-insensitive.
+///
+/// Folding maps every symbol to the canonical symbol of its ASCII case class:
+/// the symbol spelled in lowercase when the interner has it, otherwise the
+/// lowest-numbered symbol with the same lowercase spelling. Both are fixed
+/// by the interner alone, so the mapping is deterministic and does not depend
+/// on the order units or names are visited in. Tables then compare folded
+/// names, and every record keeps its written name for messages and the index.
+pub(crate) struct Fold {
+    /// By symbol id: the canonical symbol's id, or 0 for the symbol itself.
+    /// Empty when no table folds.
+    map: Vec<u32>,
+    /// Bit `t` set when table `t` folds.
+    tables: u8,
+}
+
+impl Fold {
+    /// No folding: every name is its own key.
+    pub(crate) const fn none() -> Self {
+        Self {
+            map: Vec::new(),
+            tables: 0,
+        }
+    }
+
+    /// The fold for `policy` over every symbol of `names`. Free when no table
+    /// folds; otherwise one pass over the interner, allocating only for
+    /// symbols that contain an ASCII capital.
+    pub(crate) fn build<L: Lookup>(policy: &Policy, names: &L) -> Self {
+        if !policy.any_folds() {
+            return Self::none();
+        }
+        let mut tables = 0u8;
+        for t in 0..crate::policy::TABLES {
+            if policy.table_folds(ix(t) as u8) {
+                tables |= 1 << t;
+            }
+        }
+        let n = names.len();
+        let mut map = alloc::vec![0u32; n.saturating_add(1)];
+        // Lowercase spellings that are not interned themselves: the first
+        // (lowest-numbered) symbol with that spelling stands for all.
+        let mut first: BTreeMap<String, u32> = BTreeMap::new();
+        for id in 1..=ix(n) {
+            let Some(sym) = Symbol::from_u32(id) else {
+                continue;
+            };
+            let lower = names
+                .resolve_with(sym, |s: &str| {
+                    s.bytes()
+                        .any(|b| b.is_ascii_uppercase())
+                        .then(|| s.to_ascii_lowercase())
+                })
+                .flatten();
+            let Some(lower) = lower else { continue };
+            let canon = match names.get(&lower) {
+                Some(c) => c.as_u32(),
+                None => *first.entry(lower).or_insert(id),
+            };
+            if canon != id {
+                if let Some(slot) = map.get_mut(id as usize) {
+                    *slot = canon;
+                }
+            }
+        }
+        Self { map, tables }
+    }
+
+    /// The canonical symbol of `sym`'s case class (itself without folding,
+    /// and for a symbol the interner did not have when the fold was built).
+    #[inline]
+    pub(crate) fn sym(&self, sym: Symbol) -> Symbol {
+        match self.map.get(sym.as_u32() as usize) {
+            Some(&c) if c != 0 => Symbol::from_u32(c).unwrap_or(sym),
+            _ => sym,
+        }
+    }
+
+    /// `name` folded regardless of table: the key that groups every spelling
+    /// that some table could treat as equal (identity without folding).
+    #[inline]
+    pub(crate) fn name(&self, name: Name) -> Name {
+        if self.tables == 0 {
+            return name;
+        }
+        Name {
+            sym: self.sym(name.sym),
+            mark: name.mark,
+        }
+    }
+
+    /// The key of `name` in table `t`: folded if that table folds.
+    #[inline]
+    pub(crate) fn key(&self, t: u8, name: Name) -> Name {
+        if t == ANY_NS {
+            return self.name(name);
+        }
+        if t < 8 && self.tables & (1 << t) != 0 {
+            Name {
+                sym: self.sym(name.sym),
+                mark: name.mark,
+            }
+        } else {
+            name
+        }
+    }
+
+    /// The key of `name` in the table of namespace `ns`.
+    pub(crate) fn key_ns(&self, policy: &Policy, ns: Namespace, name: Name) -> Name {
+        self.key(policy.table_ix(ns), name)
+    }
 }
 
 /// One compilation unit of the program.
@@ -102,7 +216,10 @@ pub(crate) enum Origin {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Binding {
     pub(crate) ns: u8,
+    /// The name as written (messages, suggestions, members).
     pub(crate) name: Name,
+    /// The name as the table compares it (`Fold::key(ns, name)`).
+    pub(crate) key: Name,
     pub(crate) res: Res,
     pub(crate) kind: DefKind,
     pub(crate) vis: Vis,
@@ -127,7 +244,10 @@ pub(crate) enum EntryState {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Entry {
     pub(crate) ns: u8,
+    /// The table key (folded per the table's case).
     pub(crate) name: Name,
+    /// A spelling as written, for suggestions.
+    pub(crate) spelling: Name,
     pub(crate) state: EntryState,
 }
 
@@ -163,11 +283,12 @@ pub(crate) struct Import {
 /// Everything the phases share.
 pub(crate) struct Model<'e> {
     pub(crate) policy: Policy,
+    pub(crate) fold: Fold,
     pub(crate) env: &'e dyn Env,
     pub(crate) units: Vec<Unit>,
     /// (unit id, unit index), sorted, for `DefId` lookups.
     pub(crate) unit_ix: Vec<(UnitId, u32)>,
-    /// (root name, unit index), sorted.
+    /// (root name key in the module table, unit index), sorted.
     pub(crate) roots: Vec<(Name, u32)>,
     pub(crate) scopes: Vec<Scope>,
     pub(crate) bindings: Vec<Binding>,
@@ -235,15 +356,17 @@ impl Model<'_> {
         }
     }
 
-    /// Looks a name up in a finished table: the exact namespace, else a failed
-    /// import of that name.
+    /// Looks a name up in a finished table (by its key in table `ns`): the
+    /// exact namespace, else a failed import of that name.
     pub(crate) fn find(&self, scope: u32, ns: u8, name: Name) -> Option<EntryState> {
         let table = &self.scopes.get(scope as usize)?.table;
-        let key = |e: &Entry| (e.ns, e.name).cmp(&(ns, name));
+        let k = self.fold.key(ns, name);
+        let key = |e: &Entry| (e.ns, e.name).cmp(&(ns, k));
         if let Ok(i) = table.binary_search_by(key) {
             return table.get(i).map(|e| e.state);
         }
-        let any = |e: &Entry| (e.ns, e.name).cmp(&(ANY_NS, name));
+        let k = self.fold.name(name);
+        let any = |e: &Entry| (e.ns, e.name).cmp(&(ANY_NS, k));
         table
             .binary_search_by(any)
             .ok()
@@ -295,6 +418,13 @@ impl Model<'_> {
     pub(crate) fn def_id(&self, u: u32, def: Def) -> DefId {
         let unit = self.units.get(u as usize).map_or(UnitId::new(0), |u| u.id);
         DefId::foreign(unit, def)
+    }
+
+    /// The unit index of the root named `name`, if a program unit claims it.
+    pub(crate) fn root_unit(&self, name: Name) -> Option<u32> {
+        let key = self.fold.key_ns(&self.policy, Namespace::Module, name);
+        let i = self.roots.binary_search_by(|(n, _)| n.cmp(&key)).ok()?;
+        self.roots.get(i).map(|(_, u)| *u)
     }
 
     pub(crate) fn push_binding(&mut self, b: Binding) -> u32 {
@@ -374,6 +504,7 @@ pub(crate) mod fixture {
     pub(crate) fn model(hir: Hir, names: &Interner, policy: Policy) -> Model<'static> {
         let mut m = Model {
             policy,
+            fold: super::Fold::build(&policy, names),
             env: &NoEnv,
             units: Vec::new(),
             unit_ix: alloc::vec![(hir.unit(), 0)],
@@ -387,6 +518,7 @@ pub(crate) mod fixture {
         let c = collect(
             &hir,
             &m.policy,
+            &m.fold,
             Bases {
                 unit: 0,
                 scope: 0,
@@ -512,6 +644,36 @@ mod tests {
         assert!(matches!(m.find(s, 1, x), Some(EntryState::Failed(_))));
         assert_eq!(m.find(s, 0, nowhere), None);
         assert_eq!(m.diags.len(), 1);
+    }
+
+    #[test]
+    fn test_fold_is_canonical_and_order_free() {
+        let mut names = intern_lang::Interner::new();
+        let up = names.intern("FOO");
+        let mixed = names.intern("Foo");
+        let other = names.intern("Bar");
+        let fold = Fold::build(&Policy::php(), &names);
+        // No lowercase spelling interned: the lowest-numbered variant wins.
+        assert_eq!(fold.sym(mixed), up);
+        assert_eq!(fold.sym(up), up);
+        assert_eq!(fold.sym(other), other);
+        let low = names.intern("foo");
+        let fold = Fold::build(&Policy::php(), &names);
+        assert_eq!(fold.sym(up), low);
+        assert_eq!(fold.sym(mixed), low);
+        // The constant table keeps case; the value table folds.
+        let t_const = Policy::php().table_ix(Namespace::Const);
+        let t_value = Policy::php().table_ix(Namespace::Value);
+        assert_eq!(fold.key(t_const, Name::new(up)).sym, up);
+        assert_eq!(fold.key(t_value, Name::new(up)).sym, low);
+        // Non-ASCII bytes never fold.
+        let e1 = names.intern("\u{c9}t\u{e9}");
+        let e2 = names.intern("\u{e9}t\u{e9}");
+        let fold = Fold::build(&Policy::php(), &names);
+        assert_ne!(fold.sym(e1), fold.sym(e2));
+        // Without a folding table, folding is the identity.
+        let none = Fold::build(&Policy::new(), &names);
+        assert_eq!(none.name(Name::new(up)).sym, up);
     }
 
     #[test]
