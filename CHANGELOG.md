@@ -11,13 +11,76 @@
 
 ## [Unreleased]
 
+---
+
+## [0.2.0] - 2026-10-08
+
+The foundation: name resolution over HIR. Every path and bare-identifier
+pattern of a `hir-lang` program is bound under a language's scoping policy,
+across units and imports, with diagnostics and did-you-mean suggestions, and a
+persistent definition/reference index for editor tooling.
+
 ### Added
+
+- `resolve`: the lazy path, one unit under the default (lexical) policy.
+- `Policy`, a language's scoping rules as data: hoisting per item class
+  (`Hoist::Scope`, `AfterDecl`, `Module`), which namespaces each item class
+  occupies and which namespaces share a table (`Namespace`, `NsSet`, merging),
+  shadowing (`Shadowing`), redefinition (`Redefinition`), what a class body
+  shows its methods (`ClassScope::Lexical`, `BodyOnly`, `Qualified`), nested
+  modules (`ModuleScope`), early or late binding of `self::`/`parent::`/
+  `static::` (`RootBinding`), visibility enforcement and descendant access,
+  import forms and re-export (`Reexport`), implicit globals. Presets
+  `kraken`, `php`, `python`.
+- `Resolver` (one unit with a policy, an environment, and a budget) and
+  `Program` (several units resolved against each other, with root names and
+  packages).
+- `Env`, the host interface for names outside the program (roots, prelude,
+  members of outside containers, enumeration for globs and suggestions), with
+  `Export`, `DefKind`, `NoEnv`, and the in-memory `MapEnv`.
+- Lexical resolution through `Hir::lookup_local` and the walk's scope events,
+  with per-name shadow stacks for items and imports: innermost wins by scope
+  depth and position; locals behind a frame are reported, not skipped.
+- Paths through modules, sum variants, classes, and outside containers, with
+  partial (type-directed) resolution for the rest; `::`, `self::`, `super::`
+  roots; qualified selves; access checks with private-to-descendants.
+- Imports resolved jointly as a monotone least fixpoint over all units:
+  single, aliased, glob, public/private re-export, cycles across modules and
+  units, glob ambiguity reported at the use site, import cycles, broken
+  imports; an import never resolves through itself.
+- Bare identifier patterns (`Pat::Ident`) match constants, unit variants, and
+  unit records, and bind otherwise.
+- Class member tables with mixin expansion (`insteadof`, `as` with rename and
+  visibility, mixins of mixins in dependency order), inherited lookups
+  memoized along single-base chains, private/protected member access.
+- `Diagnostic` and `DiagKind` (`#[non_exhaustive]`, 22 kinds) with English
+  messages and did-you-mean suggestions from a banded edit distance over the
+  visible names, charged to a budget.
+- `Index`: definitions (items, variants, binders, aliased imports, outside
+  targets), references per path segment (CSR by definition and by path),
+  go-to-definition by HIR id and by source offset, find-references (an
+  allocation-free iterator), rename sets that include import paths and skip
+  uses through aliases, document symbols, origins mapped through expansions to
+  source spans.
+- `Budget` (glob bindings, member steps, suggestion cells), `ResolveError`
+  (`#[non_exhaustive]`), `Limit`.
+- `ResolvedUnit::members` (effective class members after mixins) and
+  `ResolvedUnit::ident_binds`.
+- Tests: unit tests per module; integration tests for lexical scoping,
+  imports and multi-unit programs, PHP/Python/Kraken policies, suggestions,
+  the index, and hostile depths; differential property tests against a
+  reference scope-stack resolver and against a naive import fixpoint (with an
+  order-independence property); Criterion benchmarks at 124k and 1.24M nodes,
+  an import-heavy program, a multi-unit program, and index queries. Examples
+  `basic`, `multi_unit`, `lsp`.
 
 ### Changed
 
-### Fixed
-
-### Security
+- Wired `hir-lang` 0.3 and `intern-lang` 1. `symbol-lang` and `module-lang`
+  are deliberately not wired (their 1.x APIs do not fit; `dev/ROADMAP.md`
+  records why).
+- Pulled imports, globs, aliases, visibility, and the persistent index
+  (planned for 0.5.0) into 0.2.0; incremental update hooks remain 0.5.0.
 
 ---
 
@@ -34,5 +97,6 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/resolve-lang/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/resolve-lang/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jamesgober/resolve-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/resolve-lang/releases/tag/v0.1.0

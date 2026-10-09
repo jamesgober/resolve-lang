@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "resolve-lang"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -45,13 +45,17 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = ["std"]
-std = []
+std = ["hir-lang/std", "intern-lang/std"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# First-party -lang dependencies are wired at v0.2.0, when first used.
+# The HIR this crate resolves: paths, binders, walk events, `lookup_local`, and
+# the O(1)-checked `resolve`/`resolve_partial` setters.
+hir-lang = { version = "0.3", default-features = false }
+# The interner read contract (`Lookup`): did-you-mean compares names as text.
+intern-lang = { version = "1", default-features = false }
 
 
 # DEV DEPENDENCIES

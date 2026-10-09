@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1b5be9039261ef606435a84cd7ea523b1e3b34c241a4a1481909d97b5e3b6c92 # shrinks to g = [Module { defs: [Some(false), None, None], named: [None, Some((0, 5, false)), Some((0, 0, false))], globs: [(0, false)] }]
+cc 4924946b6910648013ebdb7da5d85c824d6754018cf44c01fe37661adae0f6be # shrinks to g = [Module { defs: [None, None, None], named: [None, None, Some((0, 3, false))], globs: [(1, false)] }, Module { defs: [None, None, Some(true)], named: [Some((0, 2, true)), None, None], globs: [] }], rot = 1
+cc 5a69315fa2950e201092d7966b12351e196cf3a8de2053b1903e7416b7bd081c # shrinks to g = [Module { defs: [None, None, None], named: [None, None, Some((1, 0, true))], globs: [] }, Module { defs: [Some(false), None, None], named: [None, None, None], globs: [(0, false), (2, false)] }, Module { defs: [Some(false), None, None], named: [Some((1, 5, false)), None, Some((2, 0, true))], globs: [] }]

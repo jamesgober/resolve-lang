@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3d5e82059a2ab66745d61e676ff70f469fe6e54c98090aaeafd1fef267813119 # shrinks to p = Prog { items: [(0, [], [Expr(Block([Expr(Block([Fn(2, [], [Let(0, Some(Use(1)))], None)], None)), Fn(1, [], [], None)], None))], None)] }
+cc b142a170571e232355b1a150dbe638203c9ea5de8010310eded447cb2039172e # shrinks to p = Prog { items: [(0, [], [Expr(Block([Expr(Block([Fn(0, [], [], None)], None)), Fn(3, [], [Let(0, Some(Use(3)))], None)], None))], None)] }
