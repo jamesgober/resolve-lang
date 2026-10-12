@@ -1,7 +1,8 @@
 //! Criterion benchmarks at realistic scale: whole-unit resolution at about
 //! 100k and 1M HIR nodes (also under PHP's case-insensitive tables), an
 //! import-heavy multi-module program, a multi-unit program, class
-//! hierarchies with several bases (C3) and lexically inherited members, the
+//! hierarchies with several bases (C3) and lexically inherited members, PHP
+//! classes (class names as values, interface constants, trait tables), the
 //! HIR 0.4 forms (place aliases, keyed yields, union-typed parameters), and
 //! index queries.
 
@@ -10,8 +11,8 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hir_lang::{
     Binder, BinderKind, Builder, ClassDef, Effects, Expr, ExprId, FnDef, GenericParam, Generics,
-    Hir, IdKind, Item, ItemId, ItemKind, Name, Ns, Param, Path, PathRoot, Segment, Span, Ty, TyId,
-    UnitId, Vis,
+    Hir, IdKind, Ident, InterfaceDef, Item, ItemId, ItemKind, MixinAction, MixinRule, MixinUseDef,
+    Name, Ns, Param, Path, PathRoot, Res, Segment, Span, Ty, TyId, UnitId, Vis,
 };
 use intern_lang::Interner;
 use resolve_lang::{Policy, Program, Resolver};
@@ -535,6 +536,262 @@ fn bench_classes(c: &mut Criterion) {
     group.finish();
 }
 
+/// A PHP unit of `classes` classes in chains of 50 (`Ci extends C(i-1)`), each
+/// implementing one of 400 interfaces (which extend each other in chains of
+/// four), naming classes as values (`mox.new(cj)`, spelled in lower case, the
+/// Mox `new_object` operand), reading an interface constant through its class
+/// (`Ci::K`), and, for every fifth class, using two of 200 traits with an
+/// three `insteadof` and two `as` rules.
+fn php_class_program(classes: usize, names: &mut Interner) -> Hir {
+    let mut b = Builder::new();
+    let mut pos = 0u32;
+    let mut tick = |b: &mut Builder| {
+        pos += 2;
+        b.set_span(Span::new(pos, pos + 1));
+    };
+    let n = |names: &mut Interner, s: String| Name::new(names.intern(&s));
+    let ty = |b: &mut Builder, n: Name| -> TyId {
+        let p = b.name_path(n, Ns::Type);
+        b.ty(Ty::Path(p))
+    };
+    let new_sym = names.intern("mox.new");
+    let mut items = Vec::new();
+    for m in 0..400usize {
+        let name = n(names, format!("I{m}"));
+        let one = b.int(1);
+        let konst = n(names, format!("K{m}"));
+        let k = b.item(
+            Item::new(
+                Some(konst),
+                ItemKind::Const {
+                    ty: None,
+                    value: Some(one),
+                },
+            )
+            .with_vis(Vis::Public),
+        );
+        let supers: Vec<TyId> = if m % 4 != 0 {
+            let sup = n(names, format!("I{}", m - 1));
+            vec![ty(&mut b, sup)]
+        } else {
+            Vec::new()
+        };
+        let supers = b.list(&supers);
+        let members = b.list(&[k]);
+        items.push(
+            b.item(
+                Item::new(
+                    Some(name),
+                    ItemKind::Interface(InterfaceDef {
+                        supers,
+                        items: members,
+                        ..InterfaceDef::default()
+                    }),
+                )
+                .with_vis(Vis::Public),
+            ),
+        );
+    }
+    for t in 0..200usize {
+        let name = n(names, format!("T{t}"));
+        let mut methods = Vec::new();
+        for m in 0..3 {
+            let body = b.block(&[], None);
+            let mname = n(names, format!("m{m}"));
+            methods.push(
+                b.item(
+                    Item::new(
+                        Some(mname),
+                        ItemKind::Fn(FnDef {
+                            body: Some(body),
+                            ..FnDef::default()
+                        }),
+                    )
+                    .with_vis(Vis::Public),
+                ),
+            );
+        }
+        let members = b.list(&methods);
+        items.push(
+            b.item(
+                Item::new(
+                    Some(name),
+                    ItemKind::Class(ClassDef {
+                        items: members,
+                        mixin: true,
+                        ..ClassDef::default()
+                    }),
+                )
+                .with_vis(Vis::Public),
+            ),
+        );
+    }
+    for i in 0..classes {
+        let cname = n(names, format!("C{i}"));
+        let mut own = Vec::new();
+        // The body: two class operands of `mox.new` and an interface constant.
+        tick(&mut b);
+        let callee_path = b.resolved_path(Name::new(new_sym), Ns::Value, Res::Extern(new_sym));
+        let callee = b.expr(Expr::Path(callee_path));
+        let target = n(names, format!("c{}", (i * 7 + 1) % classes));
+        let operand = b.name_expr(target);
+        let new_a = b.call(callee, &[operand]);
+        let callee_path = b.resolved_path(Name::new(new_sym), Ns::Value, Res::Extern(new_sym));
+        let callee = b.expr(Expr::Path(callee_path));
+        let other = n(names, format!("C{}", (i + 1) % classes));
+        let operand = b.name_expr(other);
+        let new_b = b.call(callee, &[operand]);
+        let konst = n(names, format!("K{}", i % 400));
+        let segs = [
+            Segment::new(cname, b.origin()),
+            Segment::new(konst, b.origin()),
+        ];
+        let segs = b.list(&segs);
+        let p = b.path(Path::new(segs, Ns::Value));
+        let through = b.expr(Expr::Path(p));
+        let list = b.list(&[new_a, new_b, through]);
+        let t = b.expr(Expr::Tuple(list));
+        let body = b.block(&[], Some(t));
+        let method = n(names, "method".to_string());
+        own.push(
+            b.item(
+                Item::new(
+                    Some(method),
+                    ItemKind::Fn(FnDef {
+                        body: Some(body),
+                        ..FnDef::default()
+                    }),
+                )
+                .with_vis(Vis::Public),
+            ),
+        );
+        if i % 5 == 0 {
+            // use Ta, Tb { Ta::m0/m1/m2 insteadof Tb; Tb::m1 as protected; Tb::m2 as extra; }
+            let ta = i % 200;
+            let mut tb = (i * 3 + 1) % 200;
+            if ta == tb {
+                tb = (tb + 1) % 200;
+            }
+            let (na, nb) = (n(names, format!("T{ta}")), n(names, format!("T{tb}")));
+            let tys = [ty(&mut b, na), ty(&mut b, nb)];
+            let mixins = b.list(&tys);
+            let others = [ty(&mut b, nb)];
+            let others = b.list(&others);
+            let others1 = [ty(&mut b, nb)];
+            let others1 = b.list(&others1);
+            let others2 = [ty(&mut b, nb)];
+            let others2 = b.list(&others2);
+            let (from_a1, from_a2) = (ty(&mut b, na), ty(&mut b, na));
+            let m0 = n(names, "m0".to_string());
+            let m1 = n(names, "m1".to_string());
+            let m2 = n(names, "m2".to_string());
+            let extra = n(names, "extra".to_string());
+            let from_a = ty(&mut b, na);
+            let from_b = ty(&mut b, nb);
+            let from_b2 = ty(&mut b, nb);
+            let rules = [
+                MixinRule {
+                    method: Ident::new(m0.sym, Span::empty(0)),
+                    from: Some(from_a),
+                    action: MixinAction::Insteadof(others),
+                },
+                MixinRule {
+                    method: Ident::new(m1.sym, Span::empty(0)),
+                    from: Some(from_a1),
+                    action: MixinAction::Insteadof(others1),
+                },
+                MixinRule {
+                    method: Ident::new(m2.sym, Span::empty(0)),
+                    from: Some(from_a2),
+                    action: MixinAction::Insteadof(others2),
+                },
+                MixinRule {
+                    method: Ident::new(m1.sym, Span::empty(0)),
+                    from: Some(from_b),
+                    action: MixinAction::Alias {
+                        name: None,
+                        vis: Some(Vis::Protected),
+                    },
+                },
+                MixinRule {
+                    method: Ident::new(m2.sym, Span::empty(0)),
+                    from: Some(from_b2),
+                    action: MixinAction::Alias {
+                        name: Some(Ident::new(extra.sym, Span::empty(0))),
+                        vis: None,
+                    },
+                },
+            ];
+            let rules = b.list(&rules);
+            own.push(b.item(Item::new(
+                None,
+                ItemKind::MixinUse(MixinUseDef { mixins, rules }),
+            )));
+        }
+        let base: Vec<TyId> = if i % 50 != 0 {
+            let bn = n(names, format!("C{}", i - 1));
+            vec![ty(&mut b, bn)]
+        } else {
+            Vec::new()
+        };
+        let iface = n(names, format!("I{}", i % 400));
+        let ifaces = [ty(&mut b, iface)];
+        let bases = b.list(&base);
+        let interfaces = b.list(&ifaces);
+        let members = b.list(&own);
+        items.push(
+            b.item(
+                Item::new(
+                    Some(cname),
+                    ItemKind::Class(ClassDef {
+                        bases,
+                        interfaces,
+                        items: members,
+                        ..ClassDef::default()
+                    }),
+                )
+                .with_vis(Vis::Public),
+            ),
+        );
+    }
+    let root = b.module(None, &items);
+    b.finish(root).unwrap()
+}
+
+fn bench_php_classes(c: &mut Criterion) {
+    // Class names as values, interface constants through classes, and trait
+    // tables with rules, in one 10,000-class unit under `Policy::php()`.
+    let mut group = c.benchmark_group("resolve_php_classes");
+    group.sample_size(10);
+    let mut names = Interner::new();
+    let hir = php_class_program(10_000, &mut names);
+    let n = nodes(&hir);
+    group.throughput(Throughput::Elements(n));
+    group.bench_function(
+        BenchmarkId::new("class_values_interface_constants_mixins", n),
+        |bench| {
+            bench.iter_batched(
+                || hir.clone(),
+                |h| {
+                    let r = Resolver::new(Policy::php()).resolve(h, &names).unwrap();
+                    assert!(
+                        r.is_clean(),
+                        "{:?}",
+                        r.diagnostics()
+                            .iter()
+                            .take(3)
+                            .map(|d| d.message(&names))
+                            .collect::<Vec<_>>()
+                    );
+                    r
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+    group.finish();
+}
+
 fn bench_index(c: &mut Criterion) {
     let mut group = c.benchmark_group("index");
     let mut names = Interner::new();
@@ -572,6 +829,7 @@ criterion_group!(
     bench_program,
     bench_php,
     bench_classes,
+    bench_php_classes,
     bench_forms,
     bench_index
 );

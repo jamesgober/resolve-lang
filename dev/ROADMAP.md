@@ -160,6 +160,50 @@ Dependency wiring (recorded per the anti-deferral rule):
 
 Known gaps carried forward: those of v0.3.0 except the `lookup_local_in` one.
 
+## v0.4.1 - bcgen-lang 0.4 findings (DONE, 2026-10-12)
+Additive patch for the three resolve-lang gaps bcgen-lang 0.4 recorded while
+compiling Mox classes (its `docs/release/v0.4.0.md` and ROADMAP "Moved" notes).
+- [x] A class name in value position resolves under `Policy::php()` (the Mox
+  sketch's `new_object` template, `mox.new(Foo, ...)`; `instanceof`'s right
+  side; `Foo::class`; static-call and constant receivers).
+- [x] An interface constant (or method) reached through an implementing class
+  resolves, in PHP's lookup order.
+- [x] Trait member tables follow PHP's copy rules; the differences bcgen-lang's
+  `tests/mixins.rs` counts are gone (16 of 200 programs before, 0 of 20,000
+  after).
+
+Delivered:
+- `Policy::with_class_values`/`class_values` and
+  `Policy::with_interface_members`/`interface_members`, off by default, on in
+  `Policy::php()`. Rules in `docs/API.md` ("Class names in value position",
+  "Interface members").
+- The mixin expansion rewritten around PHP 8's `zend_traits_copy_functions` and
+  `zend_add_trait_method`: aliases before their method, first member wins,
+  excluded methods get no visibility rule, rules name methods only, abstract
+  methods never replace, a function at two visibilities is a conflict.
+- Tests: `tests/php_classes.rs` (19), `tests/php_mixins.rs` (10): worked cases,
+  the bcgen-lang operand shape, hostile shapes (50,000-deep interface chain,
+  20,000-deep class chain, 600 interfaces under a small budget, looping
+  hierarchies, 30,000 mixin methods with 60,000 rules), and three properties against references (PHP's constant
+  lookup order, class-name case folding, PHP's trait copying).
+- Checked end to end against bcgen-lang 0.4.0's own tests with this resolve-lang
+  patched in (local copy, nothing committed there): its 15 class programs pass
+  with every `new`/`instanceof` class operand left for the resolver to
+  resolve, and `tests/mixins.rs` reports 0 differences over 20,000 seeds.
+
+Dependency wiring: unchanged (hir-lang 0.4, intern-lang 1).
+
+Recorded, not done (see `docs/API.md#what-is-not-done-yet`):
+- A function or constant named like a class wins over the class in value
+  position (the resolver cannot tell the operand of `new` from another value);
+  an interface or sum cannot be a value operand (hir-lang refuses the
+  resolution; bcgen-lang takes interfaces as type arguments, and HIR spec v3
+  lacks a way to name one in value position).
+- Ambiguous inherited constants (PHP: "inherits both A::X and B::X") are not
+  reported; `ResolvedUnit::members` does not list inherited interface members.
+- Mixin `final`, abstract-signature compatibility, and PHP 8.2 trait constant
+  conflict rules are not modelled.
+
 ## v0.5.0 - Implementation
 - [ ] Incremental update hooks: re-resolve a changed unit (and the units whose imports read it) without the rest; keep the index stable across updates.
 - [x] Imports/exports, globs, aliases, visibility; persistent index (definitions, references, rename sets) — delivered in v0.2.0.

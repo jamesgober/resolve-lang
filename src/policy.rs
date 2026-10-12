@@ -552,6 +552,8 @@ pub struct Policy {
     aliases: bool,
     reexport: Reexport,
     implicit_globals: bool,
+    class_values: bool,
+    interface_members: bool,
 }
 
 impl Default for Policy {
@@ -618,6 +620,8 @@ impl Policy {
             aliases: true,
             reexport: Reexport::AsDeclared,
             implicit_globals: false,
+            class_values: false,
+            interface_members: false,
         }
     }
 
@@ -651,9 +655,12 @@ impl Policy {
     /// | [`Const`](Namespace::Const) | constants, class constants, globals, static properties | sensitive |
     ///
     /// So a function and a constant, or a method and a class constant, may
-    /// share a name; `strlen` and `STRLEN` are one function; and a class is
-    /// a type only (construct it through a type path, as `new C` lowers).
-    /// HIR paths carry no `$` sigil, so a sketch that strips it from static
+    /// share a name; `strlen` and `STRLEN` are one function; and a class
+    /// lives in the type table only. A class named where a value goes
+    /// (`new C`, `x instanceof C`, as the Mox sketch lowers them) still
+    /// resolves, through [`class_values`](Self::class_values); a class reaches
+    /// its interfaces' constants and methods through
+    /// [`interface_members`](Self::interface_members). HIR paths carry no `$` sigil, so a sketch that strips it from static
     /// property names makes a static property and a class constant of the
     /// same name collide; keep the sigil in property names (`$count`) to
     /// keep them apart.
@@ -670,6 +677,7 @@ impl Policy {
     /// assert_eq!(p.case(Namespace::Type), Case::AsciiInsensitive);
     /// assert!(!p.globs_allowed());
     /// assert!(p.implicit_globals());
+    /// assert!(p.class_values() && p.interface_members());
     /// ```
     #[must_use]
     pub const fn php() -> Self {
@@ -713,6 +721,8 @@ impl Policy {
         p.globs = false;
         p.reexport = Reexport::Never;
         p.implicit_globals = true;
+        p.class_values = true;
+        p.interface_members = true;
         p
     }
 
@@ -977,6 +987,67 @@ impl Policy {
         self
     }
 
+    /// Sets whether a class may be named in value position.
+    ///
+    /// Languages whose classes are not values still write class names where
+    /// a value goes: `new Foo(1)` lowers to a call whose first operand is
+    /// `Foo`, and `$x instanceof Foo` takes it as its right operand. With
+    /// this set, a value path that finds nothing in the value tables falls
+    /// back to the type table and resolves to a class (or record) item there,
+    /// or to a class the host defines. It applies to unqualified names
+    /// (`Foo`), module-qualified ones (`App\Foo`, `\App\Foo`), and imported
+    /// ones, folded by the type table's case rule. A constant or function of
+    /// the same name wins, and a path that is the callee of a call does not
+    /// fall back (`Foo()` is not `new Foo`). `Foo::bar`, `Foo::C`, and
+    /// `Foo::class` need no fallback: their first segment is already looked
+    /// up as a container.
+    ///
+    /// An interface (or a sum) stays an error in value position: hir-lang
+    /// refuses a value path that resolves to one, so a lowering names an
+    /// interface through a type argument.
+    ///
+    /// Off by default; [`php`](Self::php) turns it on.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use resolve_lang::Policy;
+    ///
+    /// assert!(Policy::php().class_values());
+    /// assert!(!Policy::kraken().class_values());
+    /// assert!(Policy::kraken().with_class_values(true).class_values());
+    /// ```
+    #[must_use]
+    pub const fn with_class_values(mut self, on: bool) -> Self {
+        self.class_values = on;
+        self
+    }
+
+    /// Sets whether a class inherits the members of the interfaces it
+    /// implements.
+    ///
+    /// With this set, `Impl::NAME` finds a constant (or method) declared on
+    /// an interface `Impl` implements, directly or through a base class or a
+    /// super-interface, when neither the class nor its base classes declare
+    /// it; PHP's lookup order. Without it, interfaces contribute no members
+    /// to the classes implementing them.
+    ///
+    /// Off by default; [`php`](Self::php) turns it on.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use resolve_lang::Policy;
+    ///
+    /// assert!(Policy::php().interface_members());
+    /// assert!(!Policy::python().interface_members());
+    /// ```
+    #[must_use]
+    pub const fn with_interface_members(mut self, on: bool) -> Self {
+        self.interface_members = on;
+        self
+    }
+
     // ------------------------------------------------------------ getters
 
     /// When items of `class` become visible.
@@ -1219,6 +1290,36 @@ impl Policy {
         self.implicit_globals
     }
 
+    /// Whether a class-like item may be named in value position
+    /// ([`with_class_values`](Self::with_class_values)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use resolve_lang::Policy;
+    ///
+    /// assert!(Policy::php().class_values());
+    /// ```
+    #[must_use]
+    pub const fn class_values(&self) -> bool {
+        self.class_values
+    }
+
+    /// Whether classes inherit the members of their interfaces
+    /// ([`with_interface_members`](Self::with_interface_members)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use resolve_lang::Policy;
+    ///
+    /// assert!(Policy::php().interface_members());
+    /// ```
+    #[must_use]
+    pub const fn interface_members(&self) -> bool {
+        self.interface_members
+    }
+
     /// The export visibility of an import whose item says `declared`.
     pub(crate) const fn import_vis(&self, declared: Vis) -> Vis {
         match self.reexport {
@@ -1299,6 +1400,22 @@ mod tests {
         assert_eq!(Policy::new().import_vis(Vis::Private), Vis::Private);
         assert_eq!(Policy::python().import_vis(Vis::Private), Vis::Public);
         assert_eq!(Policy::php().import_vis(Vis::Public), Vis::Private);
+    }
+
+    #[test]
+    fn test_class_settings_are_php_only_and_independent() {
+        for p in [Policy::new(), Policy::kraken(), Policy::python()] {
+            assert!(!p.class_values() && !p.interface_members());
+        }
+        let php = Policy::php();
+        assert!(php.class_values() && php.interface_members());
+        let p = php.with_class_values(false);
+        assert!(!p.class_values() && p.interface_members());
+        let p = php.with_interface_members(false);
+        assert!(p.class_values() && !p.interface_members());
+        // The settings are part of the policy's identity.
+        assert_ne!(php, php.with_class_values(false));
+        assert_ne!(Policy::new(), Policy::new().with_interface_members(true));
     }
 
     #[test]

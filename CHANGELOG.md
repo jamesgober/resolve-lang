@@ -13,6 +13,86 @@
 
 ---
 
+## [0.4.1] - 2026-10-12
+
+Three gaps bcgen-lang 0.4 found while compiling Mox classes, closed for
+`Policy::php()`: a class name in value position (the Mox sketch's `new_object`
+template, `mox.new(Foo, ...)`), an interface constant reached through an
+implementing class, and trait (mixin) member tables that differed from PHP.
+Additive: no public item changed shape, and the new `Policy` settings are off in
+every preset but `php`.
+
+### Added
+
+- `Policy::with_class_values` and `Policy::class_values`: a value path that
+  finds nothing in the value and constant tables falls back to the type table
+  and resolves to a class (or record, or a class the `Env` defines) there.
+  Unqualified, module-qualified, `\`-rooted, and imported names all work, folded
+  by the type table's case rule; the path ends as `Res::Def(class item)` with
+  nothing left over, which is the operand shape bcgen-lang 0.4's `new`,
+  `instanceof`, and `::class` read. A constant or function of the same name
+  wins; a callee does not fall back (`Foo()` is not `new Foo`); an interface or
+  a sum stays "expected a value" because hir-lang refuses a value path to
+  one. On in `Policy::php()`, off in the other presets.
+- `Policy::with_interface_members` and `Policy::interface_members`: a class
+  inherits the constants and methods of the interfaces it implements (and of
+  those interfaces' super-interfaces, and of its base classes' interfaces), so
+  `Impl::CONST` and `self::CONST` resolve to the interface's declaration. PHP's
+  order: the class and its base classes first, then the interfaces, nearest
+  class first. Memoized per class and name, iterative, and charged to the
+  member-step budget. On in `Policy::php()`, off elsewhere.
+- Tests: `tests/php_classes.rs` (19) and `tests/php_mixins.rs` (10), including
+  the bcgen-lang operand shape resolved and compared with the hand-built one,
+  every value position (`new`, `instanceof`, `Foo::class`, `Foo::bar()`,
+  `Foo::C`), namespaced, imported, and host-defined classes, the opt-out and
+  callee cases, index and rename sets for the new references, a 50,000-deep
+  interface chain, a 20,000-deep class chain, a class implementing 600
+  interfaces under a small budget, two mixins of 30,000 methods with 60,000 rules, looping hierarchies, and three properties:
+  `Ni::Kn` against a reference of PHP's lookup order on random class and
+  interface hierarchies, class-name spellings in random case, and every member
+  of every class against a model of PHP's trait copying on random mixin graphs.
+  Unit tests for the new settings and the class-like kinds; example
+  `php_classes`; benchmark `resolve_php_classes` (10,000 classes, 245k nodes,
+  about 180-220 ms on a loaded machine; about 160 ms with both settings off).
+  The existing benchmarks do not move beyond their noise.
+
+### Fixed
+
+- **Mixin member tables followed PHP only partly** (found by bcgen-lang's
+  `tests/mixins.rs`, which counted 16 differing members in 200 random
+  programs; the same model now agrees on 20,000 and on `tests/php_mixins.rs`'s
+  1,500 cases):
+  - A visibility-only `as` rule on a method an `insteadof` rule had excluded
+    brought the excluded method back. PHP applies the rule to the copy, and
+    there is none.
+  - An `as` alias replaced a member of the same name that an earlier mixin
+    gave; PHP keeps the first (and reports the collision). Aliases are now
+    added before their method, mixin by mixin in `use` order, and the first
+    member of a name wins.
+  - `insteadof` and `as` rules matched a mixin's constants, properties, and
+    static properties as well as its methods; they name methods only (a rule
+    that names nothing else is `UnknownMixinMember`, as before).
+  - An abstract mixin method could stand in for, or hide, a concrete one; an
+    abstract method now never replaces a member, and a concrete one replaces
+    an abstract one an earlier mixin brought.
+  - The same function reaching a class twice at different visibilities (a
+    mixin used through two others with a visibility rule on one path) was not a
+    conflict; it is `MixinConflict` now, as PHP's collision check has it. The
+    same function at the same visibility (a diamond) stays no conflict.
+
+### Changed
+
+- Under `Policy::php()` (behavior, not API): programs that used to get
+  "expected a value, found class `Foo`" for `new Foo` now resolve; `Impl::X`
+  for an interface constant used to stay type-directed (`Res::Def(Impl)`,
+  one segment left) and now resolves to the constant; and a program that
+  relied on one of the mixin table bugs above gets the PHP table and, in the
+  conflict cases, a `MixinConflict`. Every other preset resolves as before.
+  A caller that wants exactly the 0.4.0 resolution under `Policy::php()` can
+  turn the two new settings off (the mixin fixes have no switch).
+
+---
+
 ## [0.4.0] - 2026-10-11
 
 Moves resolve-lang to hir-lang 0.4 (HIR spec v3), so it shares one `hir_lang`
@@ -256,7 +336,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/resolve-lang/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/resolve-lang/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/jamesgober/resolve-lang/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/jamesgober/resolve-lang/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/resolve-lang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/resolve-lang/compare/v0.1.0...v0.2.0

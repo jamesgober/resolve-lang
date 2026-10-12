@@ -302,7 +302,10 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
         }
         keys.sort();
         keys.dedup();
-        let split = m.policy.table_ix(Namespace::Const) != m.policy.table_ix(Namespace::Value);
+        // Callees are told apart for the function-before-constant order, and for
+        // the class-name fallback, which does not apply to a call.
+        let split = m.policy.table_ix(Namespace::Const) != m.policy.table_ix(Namespace::Value)
+            || m.policy.class_values();
         let mut callees = Vec::new();
         if split {
             let n = hir.count(IdKind::Expr);
@@ -1235,6 +1238,21 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
                         }
                     }
                 }
+                if hit.is_none() && self.class_value_ok(p, ns, !last) {
+                    // A class the host defines, named as a value.
+                    let t = self.m.policy.table_ix(Namespace::Type);
+                    hit = Namespace::ALL
+                        .into_iter()
+                        .filter(|nsx| self.m.policy.table_ix(*nsx) == t)
+                        .find_map(|nsx| self.m.env.member(cur.res, seg.name, nsx))
+                        .filter(|e| class_like(e.kind))
+                        .map(|e| Hit {
+                            res: e.res,
+                            kind: e.kind,
+                            vis: e.vis,
+                            binding: NONE,
+                        });
+                }
                 match hit {
                     Some(h) => {
                         if h.vis != hir_lang::Vis::Public && self.m.policy.visibility_enforced() {
@@ -1355,6 +1373,9 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
     }
 
     /// Looks a segment up in one finished table (module-qualified lookups).
+    /// A value path of a policy with [`Policy::class_values`] that finds
+    /// nothing in the value tables looks once more in the type table, for a
+    /// class-like item.
     fn in_table(
         &mut self,
         p: PathId,
@@ -1365,11 +1386,37 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
         seg: usize,
     ) -> Option<Start> {
         let ts = self.tables_for(ns, prefix, self.is_callee(p));
+        if let Some(found) = self.in_tables(p, s, name, &ts, seg, false) {
+            return Some(found);
+        }
+        if self.class_value_ok(p, ns, prefix) {
+            let t = self.m.policy.table_ix(Namespace::Type);
+            if !ts.contains(&t) {
+                return self.in_tables(p, s, name, &[t], seg, true);
+            }
+        }
+        None
+    }
+
+    /// Looks `name` up in the tables `ts` of scope `s`; with `class_only`
+    /// an entry that is not class-like is not a match.
+    fn in_tables(
+        &mut self,
+        p: PathId,
+        s: u32,
+        name: Name,
+        ts: &[u8],
+        seg: usize,
+        class_only: bool,
+    ) -> Option<Start> {
         let from = self.module();
-        for t in ts {
+        for &t in ts {
             match self.m.find(s, t, name) {
                 Some(EntryState::One(b)) => {
                     let hit = self.hit_of_binding(b)?;
+                    if class_only && !class_like(hit.kind) {
+                        continue;
+                    }
                     if let Some(x) = self.m.bindings.get(b as usize) {
                         if !self.m.accessible(x.vis, x.home, from) {
                             self.diag(
@@ -1398,6 +1445,47 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
             }
         }
         None
+    }
+
+    /// Whether value path `p` (a prefix of nothing, not a callee) may name a
+    /// class-like item that the value tables do not hold: the policy's
+    /// [`Policy::class_values`] rule.
+    fn class_value_ok(&self, p: PathId, ns: Ns, prefix: bool) -> bool {
+        self.m.policy.class_values() && ns == Ns::Value && !prefix && !self.is_callee(p)
+    }
+
+    /// The class-like item an unqualified value name stands for when the
+    /// value tables hold nothing under it: the innermost visible entry of the
+    /// type table, else the host's prelude.
+    fn class_value_start(&mut self, p: PathId, name: Name, ns: Ns, prefix: bool) -> Start {
+        if !self.class_value_ok(p, ns, prefix) {
+            return Start::Unresolved;
+        }
+        let t = self.m.policy.table_ix(Namespace::Type);
+        if let Some(Item::Table(s, i)) = self.top(t, name).map(|e| e.item) {
+            let state = self
+                .m
+                .scopes
+                .get(s as usize)
+                .and_then(|s| s.table.get(i as usize))
+                .map(|e| e.state);
+            match state {
+                Some(EntryState::One(b)) => {
+                    if let Some(h) = self.hit_of_binding(b).filter(|h| class_like(h.kind)) {
+                        return Start::Hit(h);
+                    }
+                }
+                Some(EntryState::Ambiguous(a, b)) => {
+                    self.ambiguous(p, name, a, b, 0);
+                    return Start::Done;
+                }
+                _ => {}
+            }
+        }
+        match self.prelude_hit(name, &[t]) {
+            Some(h) if class_like(h.kind) => Start::Hit(h),
+            _ => Start::Unresolved,
+        }
     }
 
     /// The kind of a visible item named `name` in a table the path's
@@ -1588,8 +1676,10 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
                     }
                 }
                 let ts = self.tables_for(ns, prefix, callee);
-                self.prelude_hit(name, &ts)
-                    .map_or(Start::Unresolved, Start::Hit)
+                match self.prelude_hit(name, &ts) {
+                    Some(h) => Start::Hit(h),
+                    None => self.class_value_start(p, name, ns, prefix),
+                }
             }
         }
     }
@@ -1801,6 +1891,18 @@ pub(crate) fn tables_for(
     out
 }
 
+/// Whether a definition is one a language with classes in value position
+/// (`new Foo`, `x instanceof Foo`) may name as a value: the kinds hir-lang
+/// accepts on a value path ([`DefKind::fits`]) that live in the type table.
+/// An interface or a sum is not among them: HIR refuses such a resolution,
+/// so a lowering names those through a type argument instead.
+fn class_like(kind: DefKind) -> bool {
+    matches!(
+        kind,
+        DefKind::Class { .. } | DefKind::Record { .. } | DefKind::Extern
+    )
+}
+
 /// How a first segment started.
 enum Start {
     Hit(Hit),
@@ -1839,6 +1941,29 @@ pub(crate) fn entry_gate(m: &Model<'_>, state: EntryState) -> Option<ItemId> {
 mod tests {
     use super::*;
     use crate::{model::fixture::*, policy::Policy};
+
+    #[test]
+    fn test_class_like_kinds_are_the_ones_a_value_path_may_name() {
+        // Exactly the type-table kinds hir-lang accepts on a value path.
+        for kind in [
+            DefKind::Class { mixin: false },
+            DefKind::Class { mixin: true },
+            DefKind::Record { unit: false },
+            DefKind::Extern,
+        ] {
+            assert!(class_like(kind) && kind.fits(Ns::Value), "{kind:?}");
+        }
+        for kind in [
+            DefKind::Interface,
+            DefKind::Sum,
+            DefKind::Alias,
+            DefKind::Prim,
+            DefKind::Module,
+            DefKind::Fn,
+        ] {
+            assert!(!class_like(kind), "{kind:?}");
+        }
+    }
 
     #[test]
     fn test_entry_gate_follows_hoisting() {

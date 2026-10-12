@@ -28,7 +28,10 @@
 //! case-insensitive value table `self::FOO()` finds method `foo`, while class
 //! constants stay case-sensitive.
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    vec::Vec,
+};
 
 use hir_lang::{
     DefId, ItemId, ItemKind, MixinAction, Name, NodeRef, PathId, PathRoot, Res, Span, Symbol, Ty,
@@ -67,12 +70,17 @@ pub(crate) struct Members {
     /// Effective member tables by scope index (empty for non-classes), sorted
     /// by (table, key).
     pub(crate) tables: Vec<Vec<Member>>,
-    /// Resolved bases by scope index.
+    /// Resolved bases by scope index (an interface's are its super-interfaces).
     pub(crate) bases: Vec<Vec<Res>>,
+    /// Implemented interfaces by scope index, filled only for policies whose
+    /// classes inherit interface members.
+    ifaces: Vec<Vec<Res>>,
     /// By scope index, for classes with several bases: the C3 linearization
     /// without the class itself.
     mro: Vec<Option<Vec<Res>>>,
     memo: BTreeMap<(u32, u8, Name), Option<Found>>,
+    /// The interface-only lookups of `iface_lookup`, by (class, table, key).
+    imemo: BTreeMap<(u32, u8, Name), Option<Found>>,
     stamp: Vec<u32>,
     epoch: u32,
     steps: u64,
@@ -107,19 +115,49 @@ fn res_key(r: Res) -> ResKey {
     }
 }
 
-/// The member a mixin rule names (as written): compared by each member's
-/// table key, so PHP's case-insensitive method names match in any case.
+/// Whether a member kind is a method: what `insteadof` and `as` rules can
+/// name. A mixin's constants, properties, and static properties are not.
+fn is_method(kind: DefKind) -> bool {
+    matches!(kind, DefKind::Fn | DefKind::Extern)
+}
+
+/// The method a mixin rule names (as written): found by its table key, so
+/// PHP's case-insensitive method names match in any case. Each source's list
+/// is sorted by (table, key), so this is a binary search per source.
 fn rule_member(
-    fold: &crate::model::Fold,
+    m: &Model<'_>,
     sources: &[Source],
     from: Option<Res>,
     sym: Symbol,
 ) -> Option<(Res, (u8, Name, u32))> {
+    let t = m.policy.table_ix(Namespace::Value);
+    let key = m.fold.key(t, Name::new(sym));
     sources
         .iter()
         .filter(|(r, _)| from.is_none_or(|f| f == *r))
-        .flat_map(|(r, list)| list.iter().map(move |x| (*r, *x)))
-        .find(|(_, (t, key, _))| key.mark.is_root() && fold.key(*t, Name::new(sym)).sym == key.sym)
+        .find_map(|(r, list)| {
+            let at = list.partition_point(|x| (x.0, x.1) < (t, key));
+            list.get(at..)?
+                .iter()
+                .take_while(|x| (x.0, x.1) == (t, key))
+                .find(|x| {
+                    m.bindings
+                        .get(x.2 as usize)
+                        .is_some_and(|b| is_method(b.kind))
+                })
+                .map(|x| (*r, *x))
+        })
+}
+
+/// Whether a binding is a method with no body (PHP's `abstract`).
+fn is_abstract_fn(m: &Model<'_>, b: Binding) -> bool {
+    let Res::Def(d) = b.res else { return false };
+    let Some((u, item)) = m.local_item(d) else {
+        return false;
+    };
+    m.units.get(u as usize).is_some_and(
+        |unit| matches!(unit.hir.item(item).kind, ItemKind::Fn(def) if def.body.is_none()),
+    )
 }
 
 /// The resolution of a type term that is a path.
@@ -140,8 +178,8 @@ fn ty_span(m: &Model<'_>, u: u32, t: TyId) -> Span {
 /// A mixin-use item and its mixins with their resolutions.
 type MixinUse = (ItemId, Vec<(TyId, Res)>);
 
-/// An `as` rule: the mixin, the member (table, name, binding), the new name,
-/// the new visibility.
+/// An `as` rule: the mixin and the method it names (table, key, binding),
+/// the new name, the new visibility.
 type AliasRule = (Res, (u8, Name, u32), Option<hir_lang::Ident>, Option<Vis>);
 
 /// A mixin's members as (table, name, binding).
@@ -159,8 +197,10 @@ impl Members {
         let mut me = Self {
             tables: (0..n).map(|_| Vec::new()).collect(),
             bases: (0..n).map(|_| Vec::new()).collect(),
+            ifaces: (0..n).map(|_| Vec::new()).collect(),
             mro: (0..n).map(|_| None).collect(),
             memo: BTreeMap::new(),
+            imemo: BTreeMap::new(),
             stamp: alloc::vec![0; n],
             epoch: 0,
             steps,
@@ -185,6 +225,20 @@ impl Members {
                     .collect();
                 if let Some(slot) = me.bases.get_mut(s) {
                     *slot = bases;
+                }
+                if m.policy.interface_members() {
+                    if let ItemKind::Class(c) = &unit.hir.item(item).kind {
+                        let ifaces: Vec<Res> = unit
+                            .hir
+                            .list(c.interfaces)
+                            .iter()
+                            .map(|t| ty_res(m, outs, u, *t).unwrap_or(Res::Err))
+                            .filter(|r| Self::usable_base(*r))
+                            .collect();
+                        if let Some(slot) = me.ifaces.get_mut(s) {
+                            *slot = ifaces;
+                        }
+                    }
                 }
             }
             let mut own: Vec<Member> = scope
@@ -578,6 +632,7 @@ impl Members {
                 });
                 members.push((t, key, b));
             }
+            members.sort_by_key(|x| (x.0, x.1));
             return Some((res, members));
         }
         let span = ty_span(m, u, ty);
@@ -625,11 +680,15 @@ impl Members {
                 sources.push(src);
             }
         }
-        let mut excluded: Vec<(Res, Symbol)> = Vec::new();
+        let value_t = m.policy.table_ix(Namespace::Value);
+        // (mixin, table, method key) of the methods `insteadof` rules exclude.
+        let mut excluded: BTreeSet<(ResKey, u8, Name)> = BTreeSet::new();
         let mut aliases: Vec<AliasRule> = Vec::new();
+        // The `as` rules by the method they name, in rule order.
+        let mut alias_of: BTreeMap<(ResKey, u8, Name), Vec<usize>> = BTreeMap::new();
         for rule in &rules {
             let from = rule.from.and_then(|t| ty_res(m, outs, u, t));
-            let Some(found) = rule_member(&m.fold, &sources, from, rule.method.sym) else {
+            let Some(found) = rule_member(m, &sources, from, rule.method.sym) else {
                 let span = if rule.method.span == Span::empty(0) {
                     use_span
                 } else {
@@ -652,13 +711,20 @@ impl Members {
                         .get(u as usize)
                         .map(|x| x.hir.list(others).to_vec())
                         .unwrap_or_default();
+                    let key = m.fold.key(value_t, Name::new(rule.method.sym));
                     for t in others {
                         if let Some(r) = ty_res(m, outs, u, t) {
-                            excluded.push((r, rule.method.sym));
+                            let _ = excluded.insert((res_key(r), value_t, key));
                         }
                     }
                 }
-                MixinAction::Alias { name, vis } => aliases.push((found.0, found.1, name, vis)),
+                MixinAction::Alias { name, vis } => {
+                    alias_of
+                        .entry((res_key(found.0), found.1.0, found.1.1))
+                        .or_default()
+                        .push(aliases.len());
+                    aliases.push((found.0, found.1, name, vis));
+                }
             }
         }
         let own: Vec<(u8, Name)> = self
@@ -666,32 +732,112 @@ impl Members {
             .get(s as usize)
             .map(|v| v.iter().map(|x| (x.ns, x.name)).collect())
             .unwrap_or_default();
-        let is_own = |key: (u8, Name)| own.binary_search(&key).is_ok();
-        // Mixin members, first mixin first; a second one with another
-        // meaning and no `insteadof` is a conflict.
-        let mut added: Vec<(u8, Name, u32, Res)> = Vec::new();
+        // PHP's `zend_traits_copy_functions`, mixin by mixin in `use` order,
+        // method by method: a method's named aliases are added before the
+        // method itself, and the first member of a name wins. An own member
+        // beats every mixin one; a method an `insteadof` rule excludes is not
+        // copied, and a visibility-only `as` rule on it has no effect (the
+        // alias applies to the copy, which does not exist).
+        let mut added: Vec<Member> = Vec::new();
+        let mut added_at: BTreeMap<(u8, Name), usize> = BTreeMap::new();
         let mut conflicts: Vec<(Name, hir_lang::DefId, hir_lang::DefId)> = Vec::new();
         for (res, list) in &sources {
-            for &(ns, name, b) in list {
-                if excluded
-                    .iter()
-                    .any(|(r, sym)| r == res && m.fold.key(ns, Name::new(*sym)).sym == name.sym)
-                    || is_own((ns, name))
-                {
+            let source_key = res_key(*res);
+            for &(ns, key, b) in list {
+                let Some(orig) = m.bindings.get(b as usize).copied() else {
                     continue;
+                };
+                let method = is_method(orig.kind);
+                let rules_of: &[usize] = if method {
+                    alias_of
+                        .get(&(source_key, ns, key))
+                        .map_or(&[][..], Vec::as_slice)
+                } else {
+                    &[]
+                };
+                let mut copies: Vec<(Name, u32)> = Vec::new();
+                for &ri in rules_of {
+                    let Some(&(_, _, Some(alias), vis)) = aliases.get(ri) else {
+                        continue;
+                    };
+                    let new_name = Name::new(alias.sym);
+                    let new_key = m.fold.key(ns, new_name);
+                    let nb = m.push_binding(Binding {
+                        name: new_name,
+                        key: new_key,
+                        vis: vis.unwrap_or(orig.vis),
+                        home: s,
+                        origin: Origin::Mixin(b),
+                        span: alias.span,
+                        ..orig
+                    });
+                    copies.push((new_key, nb));
                 }
-                if let Some(&(_, _, first, _)) = added.iter().find(|x| x.0 == ns && x.1 == name) {
-                    let fr = m.bindings.get(first as usize).map(|x| x.res);
-                    let sr = m.bindings.get(b as usize).map(|x| x.res);
-                    if let (Some(Res::Def(fd)), Some(Res::Def(sd))) = (fr, sr) {
-                        if fd != sd {
-                            let spelled = m.bindings.get(b as usize).map_or(name, |x| x.name);
-                            conflicts.push((spelled, fd, sd));
+                if !(method && excluded.contains(&(source_key, ns, key))) {
+                    // The last visibility-only `as` rule for the method wins.
+                    let vis = rules_of
+                        .iter()
+                        .filter_map(|&ri| aliases.get(ri))
+                        .filter(|a| a.2.is_none())
+                        .filter_map(|a| a.3)
+                        .next_back();
+                    let nb = match vis {
+                        Some(v) if v != orig.vis => m.push_binding(Binding {
+                            vis: v,
+                            home: s,
+                            origin: Origin::Mixin(b),
+                            ..orig
+                        }),
+                        _ => b,
+                    };
+                    copies.push((key, nb));
+                }
+                for (name, binding) in copies {
+                    if own.binary_search(&(ns, name)).is_ok() {
+                        continue;
+                    }
+                    let Some(&at) = added_at.get(&(ns, name)) else {
+                        let _ = added_at.insert((ns, name), added.len());
+                        added.push(Member {
+                            ns,
+                            name,
+                            binding,
+                            from: Some(*res),
+                        });
+                        continue;
+                    };
+                    let Some(first) = added.get(at).map(|x| x.binding) else {
+                        continue;
+                    };
+                    let (fx, sx) = (
+                        m.bindings.get(first as usize).copied(),
+                        m.bindings.get(binding as usize).copied(),
+                    );
+                    let (Some(fx), Some(sx)) = (fx, sx) else {
+                        continue;
+                    };
+                    // An abstract method never replaces a member (it only
+                    // has to be satisfied); a concrete one replaces an
+                    // abstract one an earlier mixin brought.
+                    if is_abstract_fn(m, sx) {
+                        continue;
+                    }
+                    if is_abstract_fn(m, fx) {
+                        if let Some(slot) = added.get_mut(at) {
+                            slot.binding = binding;
+                            slot.from = Some(*res);
+                        }
+                        continue;
+                    }
+                    // PHP accepts the same function at the same visibility
+                    // arriving twice (a mixin reached through two others) and
+                    // refuses anything else.
+                    if let (Res::Def(fd), Res::Def(sd)) = (fx.res, sx.res) {
+                        if fd != sd || fx.vis != sx.vis {
+                            conflicts.push((sx.name, fd, sd));
                         }
                     }
-                    continue;
                 }
-                added.push((ns, name, b, *res));
             }
         }
         conflicts.dedup_by_key(|c| c.0);
@@ -707,41 +853,7 @@ impl Members {
                 Some(NodeRef::Item(use_item)),
             );
         }
-        let mut new_members: Vec<Member> = added
-            .iter()
-            .map(|&(ns, name, binding, r)| Member {
-                ns,
-                name,
-                binding,
-                from: Some(r),
-            })
-            .collect();
-        for (r, (ns, name, b), alias, vis) in aliases {
-            let Some(orig) = m.bindings.get(b as usize).copied() else {
-                continue;
-            };
-            let new_name = alias.map_or(orig.name, |a| Name::new(a.sym));
-            let new_key = alias.map_or(name, |a| m.fold.key(ns, Name::new(a.sym)));
-            if is_own((ns, new_key)) {
-                continue;
-            }
-            let nb = m.push_binding(Binding {
-                name: new_name,
-                key: new_key,
-                vis: vis.unwrap_or(orig.vis),
-                home: s,
-                origin: Origin::Mixin(b),
-                span: alias.map_or(orig.span, |a| a.span),
-                ..orig
-            });
-            new_members.retain(|x| !(x.ns == ns && x.name == new_key));
-            new_members.push(Member {
-                ns,
-                name: new_key,
-                binding: nb,
-                from: Some(r),
-            });
-        }
+        let new_members = added;
         if let Some(t) = self.tables.get_mut(s as usize) {
             t.extend(new_members);
             t.sort_by_key(|x| (x.ns, x.name));
@@ -817,7 +929,117 @@ impl Members {
         Ok(None)
     }
 
+    /// One table's lookup: the class, its bases, and then (when the policy
+    /// has classes inherit them) the interfaces. PHP's order: a class's own
+    /// constants and methods, its parent's (which already hold the parent's
+    /// interfaces'), and last those of the interfaces it implements itself.
     fn lookup_one(
+        &mut self,
+        m: &Model<'_>,
+        s: u32,
+        t: u8,
+        written: Name,
+    ) -> Result<Option<Found>, ResolveError> {
+        if let Some(f) = self.chain_lookup(m, s, t, written)? {
+            return Ok(Some(f));
+        }
+        if !m.policy.interface_members() {
+            return Ok(None);
+        }
+        self.iface_lookup(m, s, t, written)
+    }
+
+    /// Looks for a member in the interfaces class `s` or any of its
+    /// ancestors implements (each interface with its super-interfaces), the
+    /// nearest class's first. Memoized per class, so a chain of classes
+    /// costs each of them once per name.
+    fn iface_lookup(
+        &mut self,
+        m: &Model<'_>,
+        s: u32,
+        t: u8,
+        written: Name,
+    ) -> Result<Option<Found>, ResolveError> {
+        let key = m.fold.key(t, written);
+        self.epoch = self.epoch.wrapping_add(1).max(1);
+        let epoch = self.epoch;
+        let mut chain: Vec<u32> = Vec::new();
+        let mut cur = s;
+        // The answer for what lies above the last class of `chain`.
+        let mut above: Option<Found> = None;
+        loop {
+            self.charge()?;
+            if let Some(r) = self.imemo.get(&(cur, t, key)) {
+                above = *r;
+                break;
+            }
+            match self.stamp.get_mut(cur as usize) {
+                Some(st) if *st == epoch => break,
+                Some(st) => *st = epoch,
+                None => break,
+            }
+            chain.push(cur);
+            let bases = self.bases.get(cur as usize).map_or(&[][..], Vec::as_slice);
+            match bases {
+                [] => break,
+                [base] => match m.scope_of(*base) {
+                    Some(next) => cur = next,
+                    // An outside base answers for its own ancestors.
+                    None => break,
+                },
+                _ => {
+                    let order: Vec<Res> = self
+                        .mro
+                        .get(cur as usize)
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .unwrap_or_default();
+                    for base in order {
+                        self.charge()?;
+                        if let Some(bs) = m.scope_of(base) {
+                            if let Some(f) = self.declared_ifaces(m, bs, t, written)? {
+                                above = Some(f);
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        for c in chain.into_iter().rev() {
+            let own = self.declared_ifaces(m, c, t, written)?;
+            above = own.or(above);
+            let _ = self.imemo.insert((c, t, key), above);
+        }
+        Ok(above)
+    }
+
+    /// The first member of the interfaces class `c` declares itself.
+    fn declared_ifaces(
+        &mut self,
+        m: &Model<'_>,
+        c: u32,
+        t: u8,
+        written: Name,
+    ) -> Result<Option<Found>, ResolveError> {
+        let ifaces: Vec<Res> = self.ifaces.get(c as usize).cloned().unwrap_or_default();
+        for i in ifaces {
+            self.charge()?;
+            let found = match m.scope_of(i) {
+                Some(is) => self.chain_lookup(m, is, t, written)?,
+                None if m.is_outside(i) => Self::outside_member(m, i, t, written),
+                None => None,
+            };
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
+    }
+
+    /// The class itself and its bases only.
+    fn chain_lookup(
         &mut self,
         m: &Model<'_>,
         s: u32,

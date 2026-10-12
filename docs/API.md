@@ -19,6 +19,8 @@
   - [Imports as a fixpoint](#imports-as-a-fixpoint)
   - [Bare identifier patterns](#bare-identifier-patterns)
   - [Classes, members, and mixins](#classes-members-and-mixins)
+  - [Interface members](#interface-members)
+  - [Class names in value position](#class-names-in-value-position)
   - [Case folding](#case-folding)
   - [HIR 0.4 forms](#hir-04-forms)
   - [What every path ends as](#what-every-path-ends-as)
@@ -239,12 +241,26 @@ diagnostic. [`ResolvedUnit::ident_binds`](#resolvedunit) answers which.
 ### Classes, members, and mixins
 
 Each class and interface has a member table: its own members, then what its
-mixins (PHP traits, `ItemKind::MixinUse`) contribute. For each mixin use, every
-mixin member is added unless an `insteadof` rule excludes it or the class
-defines it; two mixins contributing different members of one name without an
-`insteadof` is a [`MixinConflict`](#diagkind) (the first is kept); `m as n`
-adds an alias, `m as protected` changes visibility. Mixins that use mixins are
-expanded first; a cycle is [`MixinCycle`](#diagkind).
+mixins (PHP traits, `ItemKind::MixinUse`) contribute. The expansion follows
+PHP 8's `zend_traits_copy_functions` and `zend_add_trait_method`: for each
+mixin use, mixin by mixin in `use` order and method by method, a method's
+`as` aliases that carry a new name are added first, then the method itself.
+The first member of a name wins, and the class's own members beat every
+mixin's. A method an `insteadof` rule excludes is not copied, and a
+visibility-only `as` rule on it has no effect (there is no copy to change); of
+several visibility-only rules for one method the last wins. Rules name
+**methods**: `insteadof` and `as` do not touch a mixin's constants, properties,
+or static properties, and a rule naming something that is not a method is
+[`UnknownMixinMember`](#diagkind). An abstract method (a `Fn` item with no
+body) never replaces a member, and a concrete method replaces an abstract one
+an earlier mixin brought. The same function arriving twice at the same
+visibility (a diamond of mixins) is no conflict; anything else of one name
+that is not excluded is a [`MixinConflict`](#diagkind) (the first is kept),
+including the same function at two visibilities and an alias whose new name an
+earlier mixin already gave. Mixins that use mixins are expanded first; a cycle
+is [`MixinCycle`](#diagkind). A reference-model test (`tests/php_mixins.rs`)
+checks every member of every class on random mixin graphs against a
+transcription of those two PHP functions.
 
 Inherited lookups follow the **C3 method resolution order** (Python's): a class
 `C` with bases `B1 … Bn` (`supers` for interfaces) has the order `C` followed by
@@ -263,6 +279,51 @@ leaf (the environment answers for its ancestors); a base still being linearized
 Private members are accessible inside the class that holds them; protected
 members inside any class related by inheritance. Unqualified access to members
 follows [`ClassScope`](#classscope).
+
+### Interface members
+
+With [`Policy::interface_members`](#policy-getters) (on in
+[`Policy::php`](#policyphp)), a class inherits the members of the interfaces it
+implements: `Impl::NAME` finds a constant (or method) declared on an interface
+of `Impl`, of one of its base classes, or of one of those interfaces' own
+super-interfaces. The lookup order is PHP's: the class and its base classes
+first (own declarations, so a class constant overrides an interface constant of
+the same name, PHP 8.1), then the interfaces, the nearest class's first, each
+interface searched through its super-interfaces in C3 order. Two declarations
+PHP would reject as ambiguous (`Class C inherits both A::X and B::X`) are
+ordered the same way, deterministically, and not reported. `self::NAME` inside
+the class finds them too. The interface lookups are memoized per class and
+name, so a chain of classes costs each of them once, and every step is charged
+to the [`Budget`](#budget)'s member steps. Without the setting interfaces
+contribute no members, as in 0.4.0; [`ClassMember`](#classmember) tables still
+list a class's own and mixin members only.
+
+### Class names in value position
+
+A language whose classes are not values still writes class names where values
+go: the Mox sketch lowers `new Foo(1)` to `extern:mox.new(Foo, 1)` and
+`$x instanceof Foo` to an intrinsic taking `Foo` as an operand. With
+[`Policy::class_values`](#policy-getters) (on in [`Policy::php`](#policyphp)) a
+value path that finds nothing in the value and constant tables falls back to the
+type table and resolves to a **class** (or record, or a class the
+[`Env`](#env) defines) there: unqualified (`Foo`), module-qualified
+(`App\Foo`, `\App\Foo`), imported (`use App\Foo as Bar`), folded by the type
+table's case rule. The path ends as `Res::Def(class item)` with nothing left
+over, the shape bcgen-lang 0.4's class operations read
+(`tests/php_classes.rs` resolves that shape and compares it with the operand
+bcgen-lang's own tests build by hand). The rules, all tested:
+
+- A constant or function of the same name wins (the value tables are searched
+  first); the fallback is the last step.
+- A path that is the **callee** of a call does not fall back: `Foo()` is not
+  `new Foo`, and stays "expected a value, found class".
+- An interface or a sum is not a value hir-lang accepts a path to, so
+  `x instanceof Shape` as a value operand stays "expected a value, found
+  interface"; a lowering names an interface through a type argument.
+- `Foo::class`, `Foo::bar()` and `Foo::C` need no fallback: `Foo` is already
+  looked up as a container, and `Foo::class` ends as the class with one segment
+  left (`unresolved == 1`), which is also what bcgen-lang reads.
+- Without the setting (every other preset) nothing changes.
 
 ### Case folding
 
@@ -489,7 +550,9 @@ and case rules:
 So a function and a constant, or a method and a class constant, may share a
 name (not a [`Duplicate`](#diagkind)); `strlen()` and `STRLEN()` are one
 function; `FOO` and `foo` are two constants; and a class is a type only
-(construct it through a type path, as `new C` lowers). HIR paths carry no `$`
+(a class named in value position, as `new C` lowers it, resolves through the
+[class-values rule](#class-names-in-value-position)). Classes inherit the
+members of their interfaces ([interface members](#interface-members)). HIR paths carry no `$`
 sigil, so a sketch that strips it from static property names makes a static
 property and a class constant of one name collide: keep the sigil in property
 names (`$count`).
@@ -549,6 +612,8 @@ Each takes the policy by value and returns the changed policy.
 | `with_visibility(enforce, private_to_descendants)` | two `bool`s | Whether `Vis` is enforced; whether private items are visible in descendant modules. |
 | `with_imports(globs, aliases, reexport)` | `bool`, `bool`, [`Reexport`](#reexport) | Which import forms exist; how imports re-export. |
 | `with_implicit_globals(yes)` | `bool` | Whether an unknown `global` name binds a host global. |
+| `with_class_values(yes)` | `bool` | Whether a class may be named in value position ([rule](#class-names-in-value-position)). On in `php`. Added in 0.4.1. |
+| `with_interface_members(yes)` | `bool` | Whether classes inherit their interfaces' members ([rule](#interface-members)). On in `php`. Added in 0.4.1. |
 
 ```rust
 use resolve_lang::{
@@ -568,7 +633,10 @@ let p = Policy::new()
     .with_roots(RootBinding::Early, RootBinding::Early, RootBinding::Late)
     .with_visibility(true, false)
     .with_imports(true, false, Reexport::Never)
-    .with_implicit_globals(true);
+    .with_implicit_globals(true)
+    .with_class_values(true)
+    .with_interface_members(true);
+assert!(p.class_values() && p.interface_members());
 assert_eq!(p.hoisting(ItemClass::Fn), Hoist::AfterDecl);
 assert_eq!(p.table(Namespace::Macro), Namespace::Value);
 assert_eq!(p.case(Namespace::Module), resolve_lang::Case::AsciiInsensitive);
@@ -588,6 +656,7 @@ assert!(!p.aliases_allowed());
 | `visibility_enforced()`, `private_to_descendants()` | `bool` |
 | `globs_allowed()`, `aliases_allowed()`, `reexport()` | `bool`, `bool`, [`Reexport`](#reexport) |
 | `implicit_globals()` | `bool` |
+| `class_values()`, `interface_members()` | `bool`, `bool` (0.4.1) |
 
 ```rust
 use resolve_lang::{ItemClass, ModuleScope, Namespace, Policy, Reexport, RootBinding, Shadowing};
@@ -1534,6 +1603,12 @@ assert_eq!(SymbolKind::Place.name(), "place alias");
   orders growing linearly, so its total cost grows quadratically, as in
   Python; the budget stops it). Each did-you-mean considers at most 4,096
   candidates and is charged to the suggestion budget.
+- Interface-member lookups are memoized per (class, table, name) and walk each
+  class of a chain once; mixin expansion indexes `insteadof` and `as` rules by
+  the method they name, so a use of mixins with tens of thousands of members and
+  rules is a pass of sorted lookups (`tests/php_mixins.rs` resolves 30,000
+  methods with 60,000 rules). Class-name fallbacks cost one extra table lookup
+  on a path that would otherwise be an error.
 - With a case-insensitive table, one pass over the interner's symbols builds
   the fold (linear in the interned bytes; allocation only for symbols with an
   ASCII capital).
@@ -1541,7 +1616,7 @@ assert_eq!(SymbolKind::Place.name(), "place alias");
 
 ## What is not done yet
 
-Stated plainly, for 0.4.0:
+Stated plainly, for 0.4.1:
 
 - **Incremental update hooks** (re-resolving one changed unit, or one changed
   item, without the rest) are v0.5.0 work.
@@ -1561,6 +1636,20 @@ Stated plainly, for 0.4.0:
   at run time); both are documented leniencies, not checks. HIR paths carry no
   `$` sigil, so static properties must keep it in their names to stay apart
   from class constants. Only ASCII case folding exists (PHP 8 needs no more).
+- **Class values: a function or constant of a class's name wins.** `new foo`
+  with a function `foo` declared finds the function (the value tables come
+  first, and the resolver cannot tell the operand of `new` from any other
+  value); an interface or sum cannot be a value operand (hir-lang refuses the
+  resolution).
+- **Interface members: ambiguity is not reported.** PHP rejects a class that
+  inherits one constant name from two unrelated declarations; the lookup picks
+  the first in its documented order and says nothing. `ResolvedUnit::members`
+  does not list inherited interface members.
+- **Mixins: not modelled.** `final` on a mixin method, the abstract-signature
+  compatibility check (`do_inheritance_check_on_method`), and PHP 8.2's
+  constants-in-traits conflict rules beyond "first wins and report a different
+  declaration". The conflict check compares the function and its visibility,
+  not `static` or `final` flags.
 - An [`Env`](#env) is asked with names as written; a host serving a
   case-insensitive table folds them itself.
 - Interface default methods do not see inherited members unqualified
