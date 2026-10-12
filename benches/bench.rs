@@ -1,15 +1,17 @@
 //! Criterion benchmarks at realistic scale: whole-unit resolution at about
 //! 100k and 1M HIR nodes (also under PHP's case-insensitive tables), an
 //! import-heavy multi-module program, a multi-unit program, class
-//! hierarchies with several bases (C3) and lexically inherited members, and
+//! hierarchies with several bases (C3) and lexically inherited members, the
+//! HIR 0.4 forms (place aliases, keyed yields, union-typed parameters), and
 //! index queries.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hir_lang::{
-    Binder, BinderKind, Builder, ClassDef, Expr, ExprId, FnDef, Hir, IdKind, Item, ItemId,
-    ItemKind, Name, Ns, Param, Path, PathRoot, Segment, Span, Ty, TyId, UnitId, Vis,
+    Binder, BinderKind, Builder, ClassDef, Effects, Expr, ExprId, FnDef, GenericParam, Generics,
+    Hir, IdKind, Item, ItemId, ItemKind, Name, Ns, Param, Path, PathRoot, Segment, Span, Ty, TyId,
+    UnitId, Vis,
 };
 use intern_lang::Interner;
 use resolve_lang::{Policy, Program, Resolver};
@@ -283,6 +285,143 @@ fn bench_php(c: &mut Criterion) {
     group.finish();
 }
 
+/// `fns` generator functions over the HIR 0.4 forms, Mox style:
+/// `fn gi<T, U>(a: T | U | ?R, k) yield { let_place p = a[k] in p =
+/// f(p, k); ... yield k => a; yield from f(k) }`, four place aliases per
+/// function, with one record `R` and calls of other functions.
+fn forms_program(fns: usize, names: &mut Interner) -> Hir {
+    let mut b = Builder::new();
+    let mut pos = 0u32;
+    let mut tick = |b: &mut Builder| {
+        pos += 2;
+        b.set_span(Span::new(pos, pos + 1));
+    };
+    let n = |names: &mut Interner, s: &str| Name::new(names.intern(s));
+    let (t, u, r, a, k, p) = (
+        n(names, "T"),
+        n(names, "U"),
+        n(names, "R"),
+        n(names, "a"),
+        n(names, "k"),
+        n(names, "p"),
+    );
+    let fn_names: Vec<Name> = (0..fns).map(|i| n(names, &format!("g{i}"))).collect();
+    let path = |b: &mut Builder, name: Name, ns: Ns| {
+        let seg = Segment::new(name, b.origin());
+        let segs = b.list(&[seg]);
+        b.path(Path::new(segs, ns))
+    };
+    let mut items: Vec<ItemId> = Vec::with_capacity(fns + 1);
+    items.push(b.item(Item::new(
+        Some(r),
+        ItemKind::Record(hir_lang::RecordDef::default()),
+    )));
+    for (i, &fname) in fn_names.iter().enumerate() {
+        let tb = b.binder(Binder::new(t, BinderKind::TypeParam));
+        let ub = b.binder(Binder::new(u, BinderKind::TypeParam));
+        let gps = b.list(&[GenericParam::new(tb), GenericParam::new(ub)]);
+        tick(&mut b);
+        let members: Vec<TyId> = [t, u]
+            .iter()
+            .map(|m| {
+                let p = path(&mut b, *m, Ns::Type);
+                b.ty(Ty::Path(p))
+            })
+            .collect();
+        let rp = path(&mut b, r, Ns::Type);
+        let rt = b.ty(Ty::Path(rp));
+        let nr = b.ty(Ty::Nullable(rt));
+        let list = b.list(&[members[0], members[1], nr]);
+        let ty = b.ty(Ty::Union(list));
+        let ab = b.binder(Binder::new(a, BinderKind::Param));
+        let apat = b.bind(ab);
+        let pa = b.param(Param {
+            ty: Some(ty),
+            ..Param::new(apat)
+        });
+        let kb = b.binder(Binder::new(k, BinderKind::Param));
+        let kpat = b.bind(kb);
+        let pk = b.param(Param::new(kpat));
+        let mut stmts = Vec::new();
+        for j in 0..4 {
+            tick(&mut b);
+            let base = b.name_expr(a);
+            let index = b.name_expr(k);
+            let place = b.expr(Expr::Index { base, index });
+            let alias = b.binder(Binder::new(p, BinderKind::Place));
+            let target = b.name_expr(p);
+            let callee = b.name_expr(fn_names[(i * 31 + j) % fns]);
+            let read = b.name_expr(p);
+            let kk = b.name_expr(k);
+            let value = b.call(callee, &[read, kk]);
+            let body = b.expr(Expr::Assign {
+                target,
+                op: None,
+                value,
+            });
+            let lp = b.expr(Expr::LetPlace {
+                binder: alias,
+                place,
+                body,
+            });
+            stmts.push(b.expr_stmt(lp));
+        }
+        let key = b.name_expr(k);
+        let value = b.name_expr(a);
+        let y = b.expr(Expr::Yield {
+            key: Some(key),
+            value: Some(value),
+        });
+        stmts.push(b.expr_stmt(y));
+        let callee = b.name_expr(fn_names[(i * 7 + 1) % fns]);
+        let kk = b.name_expr(k);
+        let inner = b.call(callee, &[kk]);
+        let yf = b.expr(Expr::YieldFrom(inner));
+        stmts.push(b.expr_stmt(yf));
+        let body = b.block(&stmts, None);
+        let params = b.list(&[pa, pk]);
+        items.push(b.item(Item::new(
+            Some(fname),
+            ItemKind::Fn(FnDef {
+                generics: Generics {
+                    params: gps,
+                    preds: hir_lang::List::EMPTY,
+                },
+                params,
+                effects: Effects::YIELD,
+                body: Some(body),
+                ..FnDef::default()
+            }),
+        )));
+    }
+    let root = b.module(None, &items);
+    b.finish(root).unwrap()
+}
+
+fn bench_forms(c: &mut Criterion) {
+    let mut group = c.benchmark_group("resolve_hir_0_4_forms");
+    group.sample_size(10);
+    let mut names = Interner::new();
+    let hir = forms_program(2_000, &mut names);
+    let n = nodes(&hir);
+    group.throughput(Throughput::Elements(n));
+    group.bench_function(
+        BenchmarkId::new("place_aliases_yields_unions", n),
+        |bench| {
+            bench.iter_batched(
+                || hir.clone(),
+                |h| {
+                    let r = resolve_lang::resolve(h, &names).unwrap();
+                    assert!(r.is_clean());
+                    r
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+    group.finish();
+}
+
 /// `classes` classes, each with three bases drawn from 40 shallow base
 /// classes (Python mixin style, so every C3 order is consistent), a member,
 /// and a method naming inherited members unqualified and through the class.
@@ -433,6 +572,7 @@ criterion_group!(
     bench_program,
     bench_php,
     bench_classes,
+    bench_forms,
     bench_index
 );
 criterion_main!(benches);

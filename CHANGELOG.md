@@ -13,6 +13,84 @@
 
 ---
 
+## [0.4.0] - 2026-10-11
+
+Moves resolve-lang to hir-lang 0.4 (HIR spec v3), so it shares one `hir_lang`
+with typeck-lang 0.3 and the rest of the LexerSketch chain, and resolves every
+form 0.4 added: place-once aliases (`let_place`), keyed `yield` and
+`yield from`, and union and intersection types.
+
+### Breaking
+
+- **Depends on `hir-lang` 0.4** (was 0.3). The `Hir` that `resolve`,
+  `Resolver::resolve`, and `Program::add_unit` take, and the one
+  `Resolution::hir` returns, is hir-lang 0.4's; a caller still on hir-lang 0.3
+  gets two incompatible `hir_lang` crates (rustc E0308).
+- `SymbolKind` has a new variant, `Place` (the enum is `#[non_exhaustive]`, so
+  only code that relied on the variant list changes).
+
+### Added
+
+- Resolution of the HIR 0.4 forms. `Expr::LetPlace`: the place's operands
+  resolve in the enclosing scope, the alias (`BinderKind::Place`) in the body
+  only; named from a closure in the body it is `CannotCapture` (a place alias
+  crosses no frame); a template's alias carries its expansion's mark, so user
+  names in the body never resolve to it and are never offered it as a
+  suggestion. `Expr::Yield { key, value }` (key, then value) and
+  `Expr::YieldFrom`. Every type path inside `Ty::Union` and
+  `Ty::Intersection` members resolves like any type path.
+- `SymbolKind::Place` (`"place alias"`) for `let_place` aliases in the index.
+- Tests: `tests/hir_0_4.rs` (19): `let_place` scoping, nested aliases, an item
+  in the body, closures, shadowing policies, template hygiene and suggestions,
+  index and rename sets for template and source aliases; keyed yields and
+  `yield from`; union and intersection members, wrong-kind and unknown
+  members, a repeated member normalization drops, nested and nullable members;
+  the HIR spec §9.6 example (Mox `.=` with a union parameter) resolved under
+  `Policy::php()` and printed exactly as the spec prints it; HIR repaired by
+  `finish_lenient`; two cases that back the `lookup_local_in` decision. The
+  differential property tests (`tests/properties.rs`) now generate generic
+  parameters, `let_place`, keyed `yield` and `yield from`, and union,
+  intersection, and nullable annotations, with the reference resolver extended
+  to match; the two recorded shrunk failures of 0.2 are kept as an explicit
+  test. Benchmark `resolve_hir_0_4_forms` (192,000 nodes of place aliases,
+  keyed yields, and union-typed parameters).
+
+### Changed
+
+- `Shadowing::DenySameScope` and `Shadowing::DenyLocals` exempt place
+  aliases: lowering introduces them, the user never declares them, so an alias
+  is not reported and a local declared inside its body is not reported for
+  reusing its name.
+- hir-lang 0.4's behaviour changes reach resolution as follows, each covered
+  by a test: unions come back normalized from `finish` (sorted, flattened,
+  repeats dropped), and the dropped members are dead error paths that the
+  resolver neither resolves, diagnoses, nor indexes; the same holds for
+  subtrees a lenient repair cut off. The new unreachable reporting and the
+  two-round lenient repair change what hir-lang reports, not what reaches the
+  resolver; resolve-lang's existing tests passed against hir-lang 0.4
+  before any of them was extended.
+- `Hir::lookup_local_in` (hir-lang 0.4, LexerSketch ISSUES P13) is not used:
+  the type table's shadow stack already finds a type parameter from a path in
+  another namespace, and it also folds case in a case-insensitive type table
+  and meets value paths in a merged table, which an exact-name lookup in one
+  namespace does not.
+
+### Migration
+
+Bump both crates together:
+
+```toml
+[dependencies]
+resolve-lang = "0.4"
+hir-lang = "0.4"
+```
+
+and follow hir-lang's own 0.4 migration for the HIR you build (`Yield { key,
+value }`, `BinderKind::Place`, `OpKind::BitNot`). Nothing in resolve-lang's own
+API changed shape except the new `SymbolKind::Place`.
+
+---
+
 ## [0.3.0] - 2026-10-08
 
 The flagship semantics: what PHP (Mox) and Python (Mercury) need from name
@@ -178,7 +256,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/resolve-lang/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/resolve-lang/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/resolve-lang/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/resolve-lang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/resolve-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/resolve-lang/releases/tag/v0.1.0

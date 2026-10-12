@@ -1,7 +1,7 @@
 # resolve-lang &mdash; API Reference
 
 > Complete reference for every public item in `resolve-lang`, with examples.
-> **Status: 0.3.0, pre-1.0.** The surface is designed across the 0.x series and
+> **Status: 0.4.0, pre-1.0.** The surface is designed across the 0.x series and
 > frozen at `1.0.0`, after the LexerSketch LSP drives go-to-definition and
 > rename through it (see [`../dev/ROADMAP.md`](../dev/ROADMAP.md)).
 
@@ -20,6 +20,7 @@
   - [Bare identifier patterns](#bare-identifier-patterns)
   - [Classes, members, and mixins](#classes-members-and-mixins)
   - [Case folding](#case-folding)
+  - [HIR 0.4 forms](#hir-04-forms)
   - [What every path ends as](#what-every-path-ends-as)
 - [`resolve`](#resolve)
 - [`Policy`](#policy)
@@ -56,8 +57,8 @@ definitions and references.
 
 ```toml
 [dependencies]
-resolve-lang = "0.3"
-hir-lang = "0.3"
+resolve-lang = "0.4"
+hir-lang = "0.4"
 intern-lang = "1"
 ```
 
@@ -116,7 +117,9 @@ imports come from per-name shadow stacks the walk pushes when their scope opens
 when it closes. A binder and an item compete by scope depth and position: the
 innermost wins, and in one scope the one that became visible last. If the
 winner is a local behind a frame it cannot cross (a nested function), the path
-is reported as [`CannotCapture`](#diagkind) rather than falling back outward.
+is reported as [`CannotCapture`](#diagkind) rather than falling back outward. A
+place alias (the binder of a `let_place`) crosses no frame at all, not even a
+closure's.
 
 After the lexical scopes: the program's unit roots and the environment's roots
 (for the first segment of a longer path or an import), then the prelude.
@@ -283,6 +286,82 @@ one, folding is free. Names the [`Env`](#env) is asked for are passed as
 written: an environment serving a case-insensitive table matches them
 case-insensitively itself.
 
+### HIR 0.4 forms
+
+hir-lang 0.4 (HIR spec v3) added forms that bind or hold names. resolve-lang
+reads them through the same walk events as everything else; what each means
+for resolution:
+
+- **`let_place p = place in body`** (`Expr::LetPlace`, `BinderKind::Place`):
+  the place's operands (`$a` and `f()` in `$a[f()]`) resolve in the enclosing
+  scope, where the alias is not yet visible, so `let_place p = p[0] in p` reads
+  an outer `p` in the place and the alias in the body. The alias is visible in
+  the body only; after it, the name means what it meant before. It crosses no
+  frame: named from a closure in the body, even one with implicit captures, it
+  is [`CannotCapture`](#diagkind). Lowering introduces it for a compound
+  assignment (`.=`, `??=`, `++`), usually from a template, so its name carries
+  the expansion's mark: user names inside the body (the template's holes) never
+  resolve to it and are never offered it as a suggestion. The
+  [`Shadowing`](#shadowing) rule does not apply to it. In the
+  [`Index`](#index) it is a definition of kind [`SymbolKind::Place`](#symbolkind);
+  one from a template has its definition and references outside the source
+  (a rename lists them in `outside_source`).
+- **`Yield { key, value }`** and **`YieldFrom(e)`**: plain operands, resolved
+  key first, then value.
+- **`Ty::Union` and `Ty::Intersection`**: every member that is a type path
+  resolves like any type path (generic parameters, types of the program, the
+  environment's types). hir-lang's `finish` normalizes them first: members are
+  sorted, nested ones flattened, a nullable member hoisted, repeats dropped. A
+  dropped member becomes a dead error path that no walk reaches; resolve-lang
+  leaves it as it is, with no diagnostic and no index entry. The same holds for
+  every subtree a lenient repair (`Builder::finish_lenient`) cut off.
+
+`Hir::lookup_local_in` (also new in hir-lang 0.4) is not used: the type table's
+shadow stack already finds a type parameter from a path in another namespace
+(`T::new`), and it also folds case when the type table is case-insensitive
+(`t::new` finds `T` under [`Policy::php`](#policyphp)) and meets value paths
+when the policy merges every namespace into one table
+([`Policy::python`](#policypython)), which an exact-name lookup in one
+namespace does not.
+
+```rust
+use hir_lang::{BinderKind, Builder, Expr, Name, Res};
+use intern_lang::Interner;
+
+// fn f(a, k) { let_place p = a[k] in p = p }
+let mut names = Interner::new();
+let (a, k, p) = (
+    Name::new(names.intern("a")),
+    Name::new(names.intern("k")),
+    Name::new(names.intern("p")),
+);
+let mut b = Builder::new();
+let (pa, a_binder) = b.local_param(a);
+let (pk, _) = b.local_param(k);
+let base = b.name_expr(a);
+let index = b.name_expr(k);
+let place = b.expr(Expr::Index { base, index });
+let alias = b.new_binder(p, BinderKind::Place);
+let target = b.name_expr(p);
+let value = b.name_expr(p);
+let body = b.expr(Expr::Assign { target, op: None, value });
+let lp = b.expr(Expr::LetPlace { binder: alias, place, body });
+let fbody = b.block(&[], Some(lp));
+let f = b.func(Name::new(names.intern("f")), &[pa, pk], fbody);
+let root = b.module(None, &[f]);
+let hir = b.finish(root)?;
+let unit = hir.unit();
+
+let res = resolve_lang::resolve(hir, &names)?;
+assert!(res.is_clean());
+let hir = res.hir(unit).unwrap();
+let res_of = |e| match *hir.expr(e) { Expr::Path(p) => hir.path(p).res, _ => unreachable!() };
+assert_eq!(res_of(base), Res::Local(a_binder));
+assert_eq!(res_of(target), Res::Local(alias));
+assert_eq!(res_of(value), Res::Local(alias));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 ### What every path ends as
 
 | Outcome | `res` | Diagnostics |
@@ -291,6 +370,7 @@ case-insensitively itself.
 | Resolved, but not accessible here | the definition | exactly one `Private` |
 | Not resolvable | `Res::Err` | exactly one |
 | Already resolved (or `Err`) on input | unchanged | none (it is still indexed) |
+| Dead: a union member normalization dropped, or a subtree a lenient repair cut off | unchanged (hir-lang made it an error path) | none, and not indexed |
 | Bare identifier pattern that binds | `Res::Unresolved` | none |
 | Late-bound or not statically known (`static::x`, an unknown member) | `Res::Unresolved`, all or part type-directed | none |
 
@@ -649,7 +729,10 @@ pub enum Shadowing { Allow, DenySameScope, DenyLocals }
 `DenySameScope` reports a binder reusing a name bound earlier in the same scope;
 `DenyLocals` one reusing the name of any local visible in the same frame. Each
 reported binder gets one [`Shadowing`](#diagkind) diagnostic (its `node` is
-`None`: binders are not nodes; its span is the binder's).
+`None`: binders are not nodes; its span is the binder's). A place alias
+(`let_place`) is exempt both ways: lowering introduces it, the user never
+declares it, so it is not reported and a local declared inside its body is not
+reported for reusing its name.
 
 ```rust
 use resolve_lang::{Policy, Shadowing};
@@ -1124,7 +1207,7 @@ impl DiagKind {
 | `AmbiguousGlob { name, first, second }` | Two glob imports (or an import through them) give `name` two meanings. | `` `x` is ambiguous: more than one glob import provides it `` |
 | `Private { name, res, vis }` | Exists but not accessible here; the path keeps `res`. | `` `x` is private `` |
 | `Duplicate { name, first }` | A second definition (or an import colliding with one) in one scope and namespace. | `` `x` is defined more than once in this scope `` |
-| `CannotCapture { name, binder }` | A local behind a frame it cannot cross. | ``cannot use local `x` here: it belongs to an enclosing function`` |
+| `CannotCapture { name, binder }` | A local behind a frame it cannot cross; a place alias (`let_place`) behind any frame. | ``cannot use local `x` here: it belongs to an enclosing function`` |
 | `WrongKind { name, ns, found }` | The name exists but is the wrong kind here (also: found only in another namespace). | ``expected a type, found function `f` `` |
 | `NotAContainer { name, found }` | A path continues past something without members. | `` `f` is a function, which has no members `` |
 | `Shadowing { name, shadowed }` | A binder the [`Shadowing`](#shadowing) rule forbids. | `` `x` shadows a visible local, which this language forbids `` |
@@ -1409,7 +1492,8 @@ pub struct RenameSet { pub edits: Vec<Location>, pub outside_source: Vec<Locatio
 #[non_exhaustive]
 pub enum SymbolKind {
     Module, Function, Record, Sum, Variant, Class, Mixin, Interface, Impl, Alias, AssocType,
-    Const, Global, Import, Local, Param, Capture, TypeParam, ConstParam, Region, Label, External,
+    Const, Global, Import, Local, Param, Capture, TypeParam, ConstParam, Region, Label, Place,
+    External,
 }
 impl SymbolKind { pub const fn name(self) -> &'static str; }
 ```
@@ -1425,6 +1509,7 @@ let o = Occurrence { def: DefRef::from_index(4), reference: None };
 assert!(o.is_definition() && o.def.index() == 4);
 assert!(matches!(Target::Local(UnitId::new(0), BinderId::from_index(0).unwrap()), Target::Local(..)));
 assert_eq!(SymbolKind::External.name(), "external");
+assert_eq!(SymbolKind::Place.name(), "place alias");
 ```
 
 ## Feature flags
@@ -1456,7 +1541,7 @@ assert_eq!(SymbolKind::External.name(), "external");
 
 ## What is not done yet
 
-Stated plainly, for 0.3.0:
+Stated plainly, for 0.4.0:
 
 - **Incremental update hooks** (re-resolving one changed unit, or one changed
   item, without the rest) are v0.5.0 work.
@@ -1480,3 +1565,5 @@ Stated plainly, for 0.3.0:
   case-insensitive table folds them itself.
 - Interface default methods do not see inherited members unqualified
   (`ClassScope` applies to classes; interface bodies are never lexical).
+- `Hir::lookup_local_in` (LexerSketch ISSUES P13) is available in hir-lang 0.4
+  but deliberately not used; see [HIR 0.4 forms](#hir-04-forms).

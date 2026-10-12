@@ -608,13 +608,25 @@ impl<'p, 'e, L: Lookup> Pass<'p, 'e, L> {
         let Some(binder) = self.hir.binder(b).copied() else {
             return;
         };
+        // A type parameter also goes on the type table's shadow stack, so a
+        // path in another namespace (the prefix `T` of the value path
+        // `T::new`) finds it. `Hir::lookup_local_in` answers the same
+        // question for one exact name and namespace, but the stack also
+        // folds case when the type table is case-insensitive and meets value
+        // paths when the policy merges types into one table, and it orders
+        // the parameter against the table's items in one place.
         if binder.kind == BinderKind::TypeParam {
             let t = self.m.policy.table_ix(Namespace::Type);
             let key = self.m.fold.key(t, binder.name);
             self.push_key(t, key, NONE, Item::Binder(b));
         }
         let policy = self.m.policy.shadowing();
-        if policy == Shadowing::Allow || !binder.kind.is_value() {
+        // A place alias (`let_place`) is introduced by lowering for a
+        // compound assignment, never declared by the user, so the
+        // language's shadowing rule does not apply to it: it neither
+        // shadows a local nor is shadowed by one.
+        if policy == Shadowing::Allow || !binder.kind.is_value() || binder.kind == BinderKind::Place
+        {
             return;
         }
         let frame = ix(self.frames.len());

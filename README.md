@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, two dependencies from the family: <a href="https://crates.io/crates/hir-lang"><code>hir-lang</code></a> and <a href="https://crates.io/crates/intern-lang"><code>intern-lang</code></a>.
     </p>
     <blockquote>
-        <strong>Status: 0.3.0, pre-1.0.</strong> The public API is designed across the 0.x series and frozen at <code>1.0.0</code>, after the LexerSketch LSP drives go-to-definition and rename through it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: 0.4.0, pre-1.0, on hir-lang 0.4.</strong> The public API is designed across the 0.x series and frozen at <code>1.0.0</code>, after the LexerSketch LSP drives go-to-definition and rename through it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -50,7 +50,7 @@ What it guarantees, and how each guarantee is checked:
 
 | Guarantee | How it is held |
 |---|---|
-| Lexical resolution is right: the innermost visible binder or item wins, hoisting and frames included. | Property tests compare it with a separate reference resolver (a stack of scopes searched innermost-out) on random programs of nested blocks, items, closures, and parameters, under scope hoisting and under declare-before-use. |
+| Lexical resolution is right: the innermost visible binder or item wins, hoisting and frames included. | Property tests compare it with a separate reference resolver (a stack of scopes searched innermost-out) on random programs of nested blocks, items, closures, parameters, generic parameters, `let_place` aliases, keyed `yield` and `yield from`, and union and intersection type annotations, under scope hoisting and under declare-before-use. |
 | Imports reach the least fixpoint of their rules, whatever the order. | Property tests compare it with a naive fixpoint over random module graphs of definitions, aliased imports, and globs, public and private, with cycles and ambiguity; a second property permutes the modules and checks that nothing changes. A third compares relative imports whose first segment arrives only through a glob (or falls back to the enclosing module) with a naive fixpoint over per-table slots. |
 | PHP's name tables: functions, methods, and classes fold ASCII case; constants keep case in a table of their own. | A property test compares PHP resolution with a reference made of plain maps on random programs of functions, constants, class members, and calls spelled in random case. |
 | Several bases follow C3 (Python's MRO); a class's unqualified names see inherited members. | Property tests compare member lookup and lexical inheritance with a textbook C3 reference on random hierarchies with public, protected, and private members; inconsistent hierarchies are counted and must be reported. |
@@ -67,8 +67,8 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-resolve-lang = "0.3"
-hir-lang = "0.3"
+resolve-lang = "0.4"
+hir-lang = "0.4"
 intern-lang = "1"
 ```
 
@@ -76,7 +76,7 @@ Without the standard library:
 
 ```toml
 [dependencies]
-resolve-lang = { version = "0.3", default-features = false }
+resolve-lang = { version = "0.4", default-features = false }
 ```
 
 <hr>
@@ -245,6 +245,7 @@ More in [`examples/`](./examples): `basic` (the lazy path), `multi_unit` (two un
 - **Constants apart from functions** (PHP): a call's callee searches functions first, any other value constants first, so a method and a class constant may share a name.
 - **Paths**: `a::b::c` through modules, sum variants, and the environment's containers; partial resolution where the rest is type-directed (`Vec::new`, `T::Item`, `<T as Tr>::Out`); roots `::`, `self::`, `super::`; `self::`/`parent::`/`static::` early or late per policy.
 - **Imports**: single, aliased, glob, re-exported, private, across units, in cycles; ambiguity between globs reported where the name is used.
+- **HIR 0.4 forms**: a `let_place` alias is visible in its body only and crosses no frame (a closure naming it is reported), while its place's operands resolve outside it; a template's alias carries its mark, so user names never reach it. Keyed `yield` and `yield from` operands, and every type path in a union or intersection, resolve like any other; union members hir-lang's normalization dropped are left alone.
 - **Patterns**: a bare identifier pattern matches a constant, unit variant, or unit record of that name, and binds otherwise.
 - **Classes**: member tables with mixin expansion (`insteadof`, `as`, matched case-insensitively under PHP), inherited lookups in C3 order (Python's MRO), private and protected access; under lexical class scoping, unqualified names see inherited members before enclosing scopes.
 - **Diagnostics**: unresolved names (with a suggestion within a small edit distance), ambiguous globs, private access, duplicates, uncapturable locals, wrong kinds, import cycles, mixin conflicts, inconsistent method resolution orders.
@@ -265,7 +266,9 @@ Measured with `cargo bench --bench bench` on a desktop x86_64 machine (Windows, 
 | Eight units, each calling into the next | 992,000 nodes | 160 ms |
 | 10,000 classes with three bases each (C3), inherited members named unqualified and through the class | 219,000 nodes | 97 ms |
 
-These are library numbers: the time includes building the index and writing every resolution into the `Hir`.
+| Generator functions with four `let_place` aliases each, keyed `yield`, `yield from`, and union-typed parameters (hir-lang 0.4 forms) | 192,000 nodes | 31 ms |
+
+These are library numbers: the time includes building the index and writing every resolution into the `Hir`. The rows above the last were measured for 0.3.0; for 0.4.0 the 0.3.0 and 0.4.0 crates were run back to back on the same machine under the same load (124k- and 1.24M-node units, eight units, index queries), and 0.4.0 was within noise or faster on each. The last row was measured on a loaded machine, so it is an upper bound.
 
 <hr>
 <br>

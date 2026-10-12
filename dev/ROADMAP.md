@@ -111,6 +111,55 @@ Known gaps carried forward (see `docs/API.md#what-is-not-done-yet`):
 - No Unicode case folding (no target language needs it).
 - The hir-lang `lookup_local_in` gap (ISSUES P13) is unchanged.
 
+## v0.4.0 - HIR 0.4 (DONE, 2026-10-11)
+Move to hir-lang 0.4 (HIR spec v3) so the LexerSketch chain shares one
+`hir_lang` (typeck-lang 0.3 is on 0.4; two versions are rustc E0308), and
+resolve every form 0.4 added.
+- [x] Depend on `hir-lang = "0.4"`.
+- [x] `Expr::LetPlace` / `BinderKind::Place`: operands in the outer scope, the
+  alias in the body only, crossing no frame, hygienic when it comes from a
+  template.
+- [x] `Expr::Yield { key, value }` and `Expr::YieldFrom` operands.
+- [x] `Ty::Union` / `Ty::Intersection` members.
+- [x] `Hir::lookup_local_in` (P13): evaluated, not used (reason below).
+- [x] hir 0.4 behaviour changes checked against this crate's tests: union
+  normalization, unreachable reporting, the two-round lenient repair.
+
+Delivered:
+- Resolution of the 0.4 forms through the existing walk: `let_place` operands
+  before the alias's scope opens, the alias visible in the body only, a
+  closure naming it reported as `CannotCapture`; template aliases carry their
+  mark (never reached by user names, never suggested to them); keyed yields
+  (key, then value) and `yield from`; type paths inside unions and
+  intersections. `SymbolKind::Place` in the index.
+- `Shadowing` deny policies exempt place aliases (lowering introduces them;
+  the user never declares one).
+- Dead error paths (union members normalization dropped, subtrees a lenient
+  repair cut off) are left alone: not resolved, not diagnosed, not indexed.
+- Tests: `tests/hir_0_4.rs` (19, including the HIR spec §9.6 example resolved
+  under `Policy::php()` and printed verbatim as the spec shows it); the
+  differential property tests extended with generic parameters, `let_place`,
+  keyed `yield`/`yield from`, and union/intersection/nullable annotations (the
+  reference resolver models place aliases and type parameters); the two
+  recorded 0.2 regressions kept as an explicit test. Benchmark
+  `resolve_hir_0_4_forms` (192,000 nodes).
+
+Dependency wiring (recorded per the anti-deferral rule):
+- **hir-lang 0.4: wired** (was 0.3). Read and written through the same public
+  API: `lookup_local`, `walk_from` events, `can_reference`, `resolve_partial`.
+- **`Hir::lookup_local_in`: not used, deliberately.** The type table's shadow
+  stack already finds a type parameter from a path in another namespace
+  (`T::new`), and it also folds case when the type table is case-insensitive
+  (`t::new` finds `T` under `Policy::php()`) and meets value paths when every
+  namespace is one table (`Policy::python()`: a value `T` is the wrong kind).
+  An exact-name lookup in one namespace covers neither, so using it would mean
+  two mechanisms for one rule. Both cases are tested in `tests/hir_0_4.rs`.
+  This closes the gap carried since 0.2 (ISSUES P13) on this crate's side.
+- intern-lang 1: unchanged. symbol-lang, module-lang, diag-lang: still not
+  wired, for the reasons recorded under v0.2.0.
+
+Known gaps carried forward: those of v0.3.0 except the `lookup_local_in` one.
+
 ## v0.5.0 - Implementation
 - [ ] Incremental update hooks: re-resolve a changed unit (and the units whose imports read it) without the rest; keep the index stable across updates.
 - [x] Imports/exports, globs, aliases, visibility; persistent index (definitions, references, rename sets) — delivered in v0.2.0.

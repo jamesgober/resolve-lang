@@ -69,6 +69,9 @@ pub enum SymbolKind {
     Region,
     /// A loop or block label.
     Label,
+    /// A place alias bound by `let_place` (an alias for a place whose
+    /// operands were evaluated once, usually introduced by a template).
+    Place,
     /// Something outside the program (another package, a host symbol): it
     /// has references but no location.
     External,
@@ -108,6 +111,7 @@ impl SymbolKind {
             Self::ConstParam => "const parameter",
             Self::Region => "region",
             Self::Label => "label",
+            Self::Place => "place alias",
             Self::External => "external",
         }
     }
@@ -139,6 +143,7 @@ impl SymbolKind {
             BinderKind::ConstParam => Self::ConstParam,
             BinderKind::Region => Self::Region,
             BinderKind::Label => Self::Label,
+            BinderKind::Place => Self::Place,
         }
     }
 }

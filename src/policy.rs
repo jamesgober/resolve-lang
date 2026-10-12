@@ -348,6 +348,11 @@ pub enum Hoist {
 
 /// Whether a binder may reuse a name that is already visible.
 ///
+/// The rule is about binders a user declares. A place alias (the binder of a
+/// HIR `let_place`, which lowering introduces for a compound assignment) is
+/// exempt: it is never reported, and a local declared inside its body is not
+/// reported for reusing its name.
+///
 /// # Examples
 ///
 /// ```

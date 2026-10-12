@@ -63,7 +63,8 @@ pub enum DiagKind {
         first: Span,
     },
     /// A local of an enclosing function used where it cannot be captured
-    /// (inside a nested item, or past a frame that does not capture).
+    /// (inside a nested item, or past a frame that does not capture), or a
+    /// place alias (`let_place`) used past any frame, a closure included.
     CannotCapture {
         /// The name.
         name: Name,
