@@ -96,7 +96,7 @@ every preset but `php`.
 ## [0.4.0] - 2026-10-11
 
 Moves resolve-lang to hir-lang 0.4 (HIR spec v3), so it shares one `hir_lang`
-with typeck-lang 0.3 and the rest of the LexerSketch chain, and resolves every
+with typeck-lang 0.3 and the rest of the toolchain's chain, and resolves every
 form 0.4 added: place-once aliases (`let_place`), keyed `yield` and
 `yield from`, and union and intersection types.
 
@@ -149,7 +149,7 @@ form 0.4 added: place-once aliases (`let_place`), keyed `yield` and
   two-round lenient repair change what hir-lang reports, not what reaches the
   resolver; resolve-lang's existing tests passed against hir-lang 0.4
   before any of them was extended.
-- `Hir::lookup_local_in` (hir-lang 0.4, LexerSketch ISSUES P13) is not used:
+- `Hir::lookup_local_in` (hir-lang 0.4, issues P13) is not used:
   the type table's shadow stack already finds a type parameter from a path in
   another namespace, and it also folds case in a case-insensitive type table
   and meets value paths in a merged table, which an exact-name lookup in one
@@ -174,7 +174,7 @@ API changed shape except the new `SymbolKind::Place`.
 ## [0.3.0] - 2026-10-08
 
 The flagship semantics: what PHP (Mox) and Python (Mercury) need from name
-resolution before the Mox Demo milestone (LexerSketch ISSUES P14). Names fold
+resolution before the Mox Demo milestone (issues P14). Names fold
 case per table as PHP 8 does; PHP's constants live apart from its functions and
 methods; several bases follow Python's C3 method resolution order; unqualified
 names inside a class see inherited members; and the import corner (a relative

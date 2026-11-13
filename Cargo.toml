@@ -19,7 +19,7 @@ readme = "README.md"
 description = "Name resolution over HIR: scopes, namespaces, imports, and a persistent definition and reference index."
 
 # Keywords (5 max)
-keywords = ["resolution", "scope", "compiler", "language", "lexersketch"]
+keywords = ["resolution", "scope", "compiler", "language"]
 
 # Categories
 categories = ["compilers", "development-tools", "no-std"]
