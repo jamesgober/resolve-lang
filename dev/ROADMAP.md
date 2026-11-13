@@ -1,7 +1,6 @@
 # resolve-lang - Roadmap
 
 > Path from scaffold to a stable 1.0. Hard parts are front-loaded; each phase has hard exit criteria.
-> Master plan: ../_lexersketch/ROADMAP.md and ../_lexersketch/NEW-LIBS.md
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 
@@ -71,7 +70,7 @@ Known gaps carried forward (see `docs/API.md#what-is-not-done-yet`):
   `lookup_local_in(path, name, ns)` in hir-lang would remove that.
 
 ## v0.3.0 - Flagship semantics (DONE, 2026-10-08)
-LexerSketch ISSUES P14: the PHP (Mox) and Python (Mercury) semantics needed
+issues P14: the PHP (Mox) and Python (Mercury) semantics needed
 before the Mox Demo milestone.
 - [x] Case folding per namespace table (`Case`, `Policy::with_case`); PHP 8's
   ASCII folding for functions, methods, classes, interfaces, traits, enums,
@@ -112,7 +111,7 @@ Known gaps carried forward (see `docs/API.md#what-is-not-done-yet`):
 - The hir-lang `lookup_local_in` gap (ISSUES P13) is unchanged.
 
 ## v0.4.0 - HIR 0.4 (DONE, 2026-10-11)
-Move to hir-lang 0.4 (HIR spec v3) so the LexerSketch chain shares one
+Move to hir-lang 0.4 (HIR spec v3) so the toolchain's chain shares one
 `hir_lang` (typeck-lang 0.3 is on 0.4; two versions are rustc E0308), and
 resolve every form 0.4 added.
 - [x] Depend on `hir-lang = "0.4"`.
@@ -209,7 +208,7 @@ Recorded, not done (see `docs/API.md#what-is-not-done-yet`):
 - [x] Imports/exports, globs, aliases, visibility; persistent index (definitions, references, rename sets) — delivered in v0.2.0.
 
 ## v0.9.0 - Hardening
-- [ ] Fuzzing; scale benchmarks; audit with the LexerSketch LSP as consumer.
+- [ ] Fuzzing; scale benchmarks; audit with the toolchain's LSP as consumer.
 
 ## v1.0.0 - Stable
-- [ ] Frozen after the LexerSketch LSP drives go-to-definition and rename through it (D18).
+- [ ] Frozen after the toolchain's LSP drives go-to-definition and rename through it (D18).

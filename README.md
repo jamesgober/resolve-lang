@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, two dependencies from the family: <a href="https://crates.io/crates/hir-lang"><code>hir-lang</code></a> and <a href="https://crates.io/crates/intern-lang"><code>intern-lang</code></a>.
     </p>
     <blockquote>
-        <strong>Status: 0.4.1, pre-1.0, on hir-lang 0.4.</strong> The public API is designed across the 0.x series and frozen at <code>1.0.0</code>, after the LexerSketch LSP drives go-to-definition and rename through it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: 0.4.1, pre-1.0, on hir-lang 0.4.</strong> The public API is designed across the 0.x series and frozen at <code>1.0.0</code>, after the toolchain's LSP drives go-to-definition and rename through it. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 

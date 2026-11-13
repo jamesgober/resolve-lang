@@ -2,7 +2,7 @@
 
 > Complete reference for every public item in `resolve-lang`, with examples.
 > **Status: 0.4.0, pre-1.0.** The surface is designed across the 0.x series and
-> frozen at `1.0.0`, after the LexerSketch LSP drives go-to-definition and
+> frozen at `1.0.0`, after the toolchain's LSP drives go-to-definition and
 > rename through it (see [`../dev/ROADMAP.md`](../dev/ROADMAP.md)).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
@@ -1622,7 +1622,7 @@ Stated plainly, for 0.4.1:
   item, without the rest) are v0.5.0 work.
 - **symbol-lang and module-lang are not wired.** Their 1.x APIs do not fit:
   symbol-lang's table is a stack of per-scope maps without persistent scopes,
-  namespaces, or name iteration (LexerSketch ISSUES M37); module-lang's graph is
+  namespaces, or name iteration (issues M37); module-lang's graph is
   one flat namespace per module whose imports always re-export, with no aliases,
   globs, or paths (M38). resolve-lang keeps its own dense tables; wiring is
   revisited with their 2.0 APIs.
@@ -1654,5 +1654,5 @@ Stated plainly, for 0.4.1:
   case-insensitive table folds them itself.
 - Interface default methods do not see inherited members unqualified
   (`ClassScope` applies to classes; interface bodies are never lexical).
-- `Hir::lookup_local_in` (LexerSketch ISSUES P13) is available in hir-lang 0.4
+- `Hir::lookup_local_in` (issues P13) is available in hir-lang 0.4
   but deliberately not used; see [HIR 0.4 forms](#hir-04-forms).
